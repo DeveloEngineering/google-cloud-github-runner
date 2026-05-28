@@ -90,7 +90,10 @@ resource "null_resource" "build-github-runners-images" {
   for_each = local_file.github-runners-images
 
   triggers = {
-    script_hash = sha256(each.value.content)
+    script_hash    = sha256(each.value.content)
+    # Rebuild when startup/install.sh changes. Without this, edits to the
+    # startup script update the GCS blob but never re-bake the image.
+    install_sh_md5 = filemd5("${path.module}/startup/install.sh")
   }
 
   provisioner "local-exec" {

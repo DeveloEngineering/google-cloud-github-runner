@@ -209,14 +209,19 @@ variable "github_runners_default_type" {
     amd64 = {
       instance_type               = "e2-standard-4"
       disk_type                   = "pd-ssd"
-      disk_size                   = 10
+      # Builder disk needs to fit Ubuntu (~5 GB), Docker + runner (~1.5 GB),
+      # baseline apt packages (~0.5 GB), pre-installed Node + Playwright libs +
+      # chromium + pre-pulled CI Docker images (~2.5 GB). 10 GB leaves no
+      # margin and OOM-disk fails intermittently. Bake on 30, restore onto
+      # the larger per-runner-type disks listed in github_runners_types.
+      disk_size                   = 30
       disk_provisioned_iops       = 0
       disk_provisioned_throughput = 0
     }
     arm64 = {
       instance_type               = "c4a-standard-4"
       disk_type                   = "hyperdisk-balanced"
-      disk_size                   = 10
+      disk_size                   = 30
       disk_provisioned_iops       = 3060
       disk_provisioned_throughput = 155
     }
