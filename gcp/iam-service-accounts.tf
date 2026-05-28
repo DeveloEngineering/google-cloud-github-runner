@@ -50,6 +50,25 @@ resource "time_sleep" "wait_for_service_account_cloud_run" {
   create_duration = "30s"
 }
 
+# Service Account for Cloud Scheduler to invoke the orphan-runner sweeper.
+# This SA does not need any project roles: the Cloud Run service authorizes
+# requests at the app layer by verifying the OIDC token's email claim against
+# SWEEP_OIDC_SERVICE_ACCOUNT_EMAIL.
+module "service-account-cloud-scheduler-sweeper" {
+  source       = "git::https://github.com/GoogleCloudPlatform/cloud-foundation-fabric//modules/iam-service-account?ref=v53.0.0"
+  project_id   = module.project.project_id
+  name         = "github-runners-sweeper"
+  display_name = "Cloud Scheduler - Orphan runner sweeper (Terraform managed)"
+}
+
+# Wait for service account to be fully propagated in Google Cloud IAM
+resource "time_sleep" "wait_for_service_account_cloud_scheduler" {
+  depends_on = [
+    module.service-account-cloud-scheduler-sweeper
+  ]
+  create_duration = "30s"
+}
+
 # Service Account for Cloud Build (Image Creation)
 module "service-account-cloud-build-github-runners" {
   source       = "git::https://github.com/GoogleCloudPlatform/cloud-foundation-fabric//modules/iam-service-account?ref=v53.0.0"

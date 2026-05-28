@@ -6,6 +6,7 @@ variable "apis" {
     "artifactregistry.googleapis.com",
     "cloudbuild.googleapis.com",
     "cloudresourcemanager.googleapis.com",
+    "cloudscheduler.googleapis.com",
     "compute.googleapis.com",
     "iam.googleapis.com",
     "logging.googleapis.com",
@@ -99,7 +100,7 @@ variable "github_runners_manager_min_instance_count" {
 variable "github_runners_manager_max_instance_count" {
   description = "GitHub Actions Runners manager app maximum instance count (Max. number of Cloud Run instances)"
   type        = number
-  default     = 1
+  default     = 5
 
   validation {
     condition     = var.github_runners_manager_max_instance_count >= var.github_runners_manager_min_instance_count
@@ -107,16 +108,54 @@ variable "github_runners_manager_max_instance_count" {
   }
 }
 
-# Maximum runtime for GitHub Actions runner VMs before Compute Engine force-deletes them
+# Per-instance concurrency for the Cloud Run service. Lower values cause Cloud Run to
+# scale out sooner under burst webhook traffic; higher values pack more requests into
+# each instance. Each request acquires one gunicorn thread for its full duration.
+variable "github_runners_manager_max_concurrency" {
+  description = "Maximum concurrent requests per Cloud Run instance for the runners manager"
+  type        = number
+  default     = 20
+
+  validation {
+    condition     = var.github_runners_manager_max_concurrency > 0
+    error_message = "Concurrency must be greater than 0."
+  }
+}
+
+# Maximum runtime for GitHub Actions runner VMs before Compute Engine force-deletes them.
+# A short value is the last line of defence against orphan VMs when both the
+# completion webhook and the periodic sweeper fail to delete an instance.
 variable "github_runners_max_run_duration" {
   description = "Maximum runtime in seconds for GitHub Actions runner VMs before termination"
   type        = number
-  default     = (86400 * 5) + 300
+  default     = 14400 # 4 hours
 
   validation {
     condition     = var.github_runners_max_run_duration > 0
     error_message = "Maximum run duration must be greater than 0 seconds."
   }
+}
+
+# Age in seconds after which an idle gcp-runner-* VM is considered orphaned and the
+# periodic sweeper will delete it. Should comfortably exceed the longest expected
+# CI job duration; lower values reclaim quota sooner.
+variable "github_runners_orphan_max_age_seconds" {
+  description = "Age threshold above which the sweeper deletes runner VMs (must exceed your longest CI job)"
+  type        = number
+  default     = 7200 # 2 hours
+
+  validation {
+    condition     = var.github_runners_orphan_max_age_seconds >= 600
+    error_message = "Orphan max age must be at least 600 seconds (10 minutes) to avoid sweeping live jobs."
+  }
+}
+
+# Cron schedule for the orphan-runner sweeper job.
+variable "github_runners_orphan_sweep_schedule" {
+  description = "Cloud Scheduler cron expression for the orphan-runner sweeper"
+  type        = string
+  default     = "*/10 * * * *"
+  nullable    = false
 }
 
 # Map of default VM images for GitHub Actions Runners by architecture

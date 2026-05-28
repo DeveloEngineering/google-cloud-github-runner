@@ -15,6 +15,7 @@ class TestWebhookService:
 
         mock_gc_client = Mock()
         mock_gc_client.create_runner_instance.return_value = "gcp-runner-abc123"
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -42,6 +43,7 @@ class TestWebhookService:
             'gcp-ubuntu-24.04',
             'owner/repo',
             delivery_id="delivery-001",
+            job_id=None,
         )
 
     @patch('app.services.webhook_service.GCloudClient')
@@ -54,6 +56,7 @@ class TestWebhookService:
 
         mock_gc_client = Mock()
         mock_gc_client.create_runner_instance.return_value = "gcp-runner-org456"
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -87,6 +90,7 @@ class TestWebhookService:
         mock_gh_client_class.return_value = mock_gh_client
 
         mock_gc_client = Mock()
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -118,6 +122,7 @@ class TestWebhookService:
         mock_gh_client_class.return_value = mock_gh_client
 
         mock_gc_client = Mock()
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -146,6 +151,7 @@ class TestWebhookService:
         mock_gh_client_class.return_value = mock_gh_client
 
         mock_gc_client = Mock()
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -171,6 +177,7 @@ class TestWebhookService:
         mock_gh_client_class.return_value = mock_gh_client
 
         mock_gc_client = Mock()
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -197,6 +204,7 @@ class TestWebhookService:
         mock_gh_client_class.return_value = mock_gh_client
 
         mock_gc_client = Mock()
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -223,6 +231,7 @@ class TestWebhookService:
 
         mock_gc_client = Mock()
         mock_gc_client.delete_runner_instance.side_effect = Exception("Delete Error")
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -258,6 +267,7 @@ class TestWebhookServiceDeliveryIdLogging:
 
         mock_gc_client = Mock()
         mock_gc_client.create_runner_instance.return_value = "runner-abc123"
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -291,6 +301,7 @@ class TestWebhookServiceDeliveryIdLogging:
         mock_gh_client_class.return_value = mock_gh_client
 
         mock_gc_client = Mock()
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -317,7 +328,9 @@ class TestWebhookServiceDeliveryIdLogging:
     ):
         """Test that delivery_id appears in warning log when no matching label."""
         mock_gh_client_class.return_value = Mock()
-        mock_gc_client_class.return_value = Mock()
+        mock_gc_client_inline = Mock()
+        mock_gc_client_inline.find_runner_by_job_id.return_value = None
+        mock_gc_client_class.return_value = mock_gc_client_inline
 
         service = WebhookService()
 
@@ -347,7 +360,9 @@ class TestWebhookServiceDeliveryIdLogging:
         mock_gh_client.get_registration_token.side_effect = Exception("API Error")
         mock_gh_client_class.return_value = mock_gh_client
 
-        mock_gc_client_class.return_value = Mock()
+        mock_gc_client_inline = Mock()
+        mock_gc_client_inline.find_runner_by_job_id.return_value = None
+        mock_gc_client_class.return_value = mock_gc_client_inline
 
         service = WebhookService()
 
@@ -380,6 +395,7 @@ class TestWebhookServiceDeliveryIdLogging:
 
         mock_gc_client = Mock()
         mock_gc_client.create_runner_instance.return_value = "runner-fwd-123"
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -400,6 +416,7 @@ class TestWebhookServiceDeliveryIdLogging:
             "gcp-ubuntu-24.04",
             "owner/repo",
             delivery_id="fwd-create-001",
+            job_id=None,
         )
 
     @patch("app.services.webhook_service.GCloudClient")
@@ -414,6 +431,7 @@ class TestWebhookServiceDeliveryIdLogging:
 
         mock_gc_client = Mock()
         mock_gc_client.create_runner_instance.return_value = "runner-fwd-456"
+        mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
         service = WebhookService()
@@ -430,3 +448,43 @@ class TestWebhookServiceDeliveryIdLogging:
         mock_gh_client.get_registration_token.assert_called_once_with(
             repo_name="owner/repo", delivery_id="fwd-gh-001"
         )
+
+
+class TestWebhookServiceIdempotency:
+    """Idempotency behavior when the same queued webhook is delivered twice."""
+
+    @patch('app.services.webhook_service.GCloudClient')
+    @patch('app.services.webhook_service.GitHubClient')
+    def test_queued_webhook_redelivery_does_not_create_second_runner(
+        self, mock_gh_client_class, mock_gc_client_class
+    ):
+        """A queued webhook for a job that already has a VM must not create another."""
+        mock_gh_client = Mock()
+        mock_gh_client_class.return_value = mock_gh_client
+
+        existing_instance = Mock()
+        existing_instance.name = "gcp-runner-existing"
+
+        mock_gc_client = Mock()
+        mock_gc_client.find_runner_by_job_id.return_value = existing_instance
+        mock_gc_client_class.return_value = mock_gc_client
+
+        service = WebhookService()
+        payload = {
+            'action': 'queued',
+            'workflow_job': {
+                'id': 999,
+                'labels': ['gcp-ubuntu-24.04'],
+            },
+            'repository': {
+                'html_url': 'https://github.com/owner/repo',
+                'full_name': 'owner/repo',
+            },
+        }
+
+        result = service.handle_workflow_job(payload, delivery_id="redeliver-001")
+
+        assert result == {'action': 'skipped', 'runner_name': 'gcp-runner-existing'}
+        mock_gc_client.find_runner_by_job_id.assert_called_once_with(999)
+        mock_gc_client.create_runner_instance.assert_not_called()
+        mock_gh_client.get_registration_token.assert_not_called()

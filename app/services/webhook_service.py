@@ -80,6 +80,23 @@ class WebhookService:
                     template_name,
                     delivery_id,
                 )
+                job_id = workflow_job.get('id')
+
+                # Idempotency: if a VM with this job_id already exists (e.g.
+                # GitHub redelivered the queued webhook), do not create a
+                # second VM. find_runner_by_job_id returns None when job_id
+                # is missing, so unlabeled legacy traffic still works.
+                existing = self.gcloud_client.find_runner_by_job_id(job_id)
+                if existing is not None:
+                    logger.info(
+                        "Runner already exists for job_id=%s (name=%s); "
+                        "skipping create. delivery_id: %s",
+                        job_id,
+                        existing.name,
+                        delivery_id,
+                    )
+                    return {'action': 'skipped', 'runner_name': existing.name}
+
                 instance_name = self._handle_queued_job(
                     template_name,
                     repo_url,
@@ -87,6 +104,7 @@ class WebhookService:
                     repo_name,
                     org_name,
                     delivery_id=delivery_id,
+                    job_id=job_id,
                 )
                 return {'action': 'created', 'runner_name': instance_name}
             else:
@@ -115,6 +133,7 @@ class WebhookService:
         repo_name,
         org_name,
         delivery_id=None,
+        job_id=None,
     ):
         """Handle queued workflow job.
 
@@ -134,6 +153,7 @@ class WebhookService:
                     template_name,
                     repo_name,
                     delivery_id=delivery_id,
+                    job_id=job_id,
                 )
             elif repo_name:
                 # Create GitHub Actions runner instance for repository
@@ -141,7 +161,12 @@ class WebhookService:
                     repo_name=repo_name, delivery_id=delivery_id
                 )
                 return self.gcloud_client.create_runner_instance(
-                    token, repo_url, template_name, repo_name, delivery_id=delivery_id
+                    token,
+                    repo_url,
+                    template_name,
+                    repo_name,
+                    delivery_id=delivery_id,
+                    job_id=job_id,
                 )
             else:
                 logger.error(

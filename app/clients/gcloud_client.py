@@ -6,9 +6,22 @@ import os
 import re
 import uuid
 import shlex
+from datetime import datetime, timezone
 import google.cloud.compute_v1 as compute_v1
 
 logger = logging.getLogger(__name__)
+
+# Labels longer than 63 chars or with characters outside [a-z0-9_-] are
+# rejected by the Compute Engine API.
+_LABEL_VALUE_RE = re.compile(r'[^a-z0-9_-]')
+
+
+def _sanitize_label_value(value):
+    """Coerce an arbitrary string into a valid GCE label value."""
+    if value is None:
+        return ''
+    lowered = str(value).lower()
+    return _LABEL_VALUE_RE.sub('-', lowered)[:63]
 
 
 class GCloudClient:
@@ -62,6 +75,7 @@ class GCloudClient:
         template_name,
         instance_label=None,
         delivery_id=None,
+        job_id=None,
     ):
         """
         Create a new GCE instance for a GitHub Actions runner.
@@ -112,13 +126,20 @@ class GCloudClient:
         instance_resource = compute_v1.Instance()  # google.cloud.compute_v1.types.Instance
         instance_resource.name = instance_name
 
+        labels = {}
         if instance_label is not None:
             owner, repo = instance_label.split("/")
-            instance_resource.labels = {
-                "gha-owner": owner.lower(),
-                "gha-repo": repo.lower(),
-                "gha-runner": template_name
-            }
+            labels.update({
+                "gha-owner": _sanitize_label_value(owner),
+                "gha-repo": _sanitize_label_value(repo),
+                "gha-runner": _sanitize_label_value(template_name),
+            })
+        if job_id is not None:
+            # Used to dedupe re-delivered queued webhooks: the webhook service
+            # filters on this label before creating a new VM.
+            labels["gha-job-id"] = _sanitize_label_value(job_id)
+        if labels:
+            instance_resource.labels = labels
 
         # Set metadata (startup script) - use shlex.quote to prevent command injection
         runner_group_flag = ""
@@ -200,3 +221,65 @@ class GCloudClient:
                 delivery_id,
             )
             raise
+
+    def list_runner_instances(self, name_prefix='gcp-runner-'):
+        """
+        List GCE instances managed by this service in the configured zone.
+
+        Args:
+            name_prefix (str): Only return instances whose name starts with
+                this prefix. Defaults to 'gcp-runner-' which matches every
+                instance created by create_runner_instance.
+
+        Yields:
+            google.cloud.compute_v1.Instance: instances matching the prefix.
+        """
+        request = compute_v1.ListInstancesRequest(
+            project=self.project_id,
+            zone=self.zone,
+            # Server-side filter on name prefix. The Compute API filter language
+            # uses regex-like equality on string fields.
+            filter=f'name eq "{name_prefix}.*"',
+        )
+        try:
+            for instance in self.instance_client.list(request=request):
+                # Defensive: the API filter is best-effort; double-check locally.
+                if instance.name.startswith(name_prefix):
+                    yield instance
+        except Exception as e:
+            logger.error("Failed to list instances with prefix %s: %s", name_prefix, e)
+            raise
+
+    def find_runner_by_job_id(self, job_id):
+        """
+        Return the first runner instance tagged with the given GitHub job_id, or None.
+
+        Used to dedupe re-delivered workflow_job.queued webhooks so we do not
+        create two VMs for the same job.
+        """
+        if job_id is None:
+            return None
+        target = _sanitize_label_value(job_id)
+        for instance in self.list_runner_instances():
+            if instance.labels.get('gha-job-id') == target:
+                return instance
+        return None
+
+    @staticmethod
+    def instance_age_seconds(instance):
+        """
+        Return how many seconds ago the GCE instance was created, or None if unparseable.
+        """
+        ts = instance.creation_timestamp
+        if not ts:
+            return None
+        try:
+            # Compute API returns RFC3339 timestamps with offset, e.g.
+            # "2026-05-28T14:35:01.123-07:00". Python 3.11+ handles fromisoformat.
+            created = datetime.fromisoformat(ts)
+        except ValueError:
+            logger.warning("Could not parse creation_timestamp '%s'", ts)
+            return None
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created).total_seconds()

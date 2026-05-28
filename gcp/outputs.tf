@@ -4,6 +4,11 @@ output "github_runners_manager_url" {
   value = module.cloud_run_github_runners_manager.service_uri
 }
 
+# Name of the Cloud Scheduler job that sweeps orphan runner VMs.
+output "github_runners_orphan_sweeper_job" {
+  value = google_cloud_scheduler_job.github_runners_orphan_sweeper.name
+}
+
 # Generate Cloud Build configuration for building the manager container image
 resource "local_file" "cloudbuild-github-runners-manager-config" {
   filename        = "${path.module}/cloudbuild-container.yaml"

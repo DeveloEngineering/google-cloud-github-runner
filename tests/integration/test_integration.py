@@ -67,6 +67,7 @@ class TestIntegrationWorkflow:
 
         mock_gc_instance = Mock()
         mock_gc_instance.create_runner_instance.return_value = "runner-test"
+        mock_gc_instance.find_runner_by_job_id.return_value = None
         mock_gcloud.return_value = mock_gc_instance
 
         # Send workflow_job webhook

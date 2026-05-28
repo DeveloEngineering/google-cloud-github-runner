@@ -29,9 +29,14 @@ module "cloud_run_github_runners_manager" {
         startup_cpu_boost = false # We do not scale to zero.
       }
       env = {
-        GOOGLE_CLOUD_PROJECT = var.project_id
-        GOOGLE_CLOUD_ZONE    = "${var.region}-${var.zone}"
-        GITHUB_RUNNER_GROUP  = var.github_runner_group
+        GOOGLE_CLOUD_PROJECT                  = var.project_id
+        GOOGLE_CLOUD_ZONE                     = "${var.region}-${var.zone}"
+        GITHUB_RUNNER_GROUP                   = var.github_runner_group
+        GITHUB_RUNNERS_ORPHAN_MAX_AGE_SECONDS = tostring(var.github_runners_orphan_max_age_seconds)
+        # Service account email Cloud Scheduler signs OIDC tokens with when
+        # invoking /sweep. The app verifies the token's email claim against
+        # this value to authenticate sweeper requests.
+        SWEEP_OIDC_SERVICE_ACCOUNT_EMAIL = module.service-account-cloud-scheduler-sweeper.email
       }
       env_from_key = {
         GITHUB_APP_ID = {
@@ -65,6 +70,10 @@ module "cloud_run_github_runners_manager" {
     # Second generation Cloud Run for faster CPU.
     # The first generation with faster cold starts is still too slow for our webhook.
     gen2_execution_environment = true
+    # Cap concurrent requests per instance so Cloud Run scales out under burst
+    # webhook traffic instead of queueing requests behind a single instance's
+    # gunicorn thread pool.
+    max_concurrency = var.github_runners_manager_max_concurrency
     scaling = {
       min_instance_count = var.github_runners_manager_min_instance_count # Min. 1, we do not scale to zero.
       max_instance_count = var.github_runners_manager_max_instance_count
@@ -77,6 +86,7 @@ module "cloud_run_github_runners_manager" {
   deletion_protection = false
   depends_on = [
     google_secret_manager_secret_version.secret-version-default,
-    time_sleep.wait_for_service_account_cloud_run
+    time_sleep.wait_for_service_account_cloud_run,
+    time_sleep.wait_for_service_account_cloud_scheduler
   ]
 }

@@ -17,6 +17,7 @@ class TestAppFactory:
 
         assert 'setup' in blueprint_names
         assert 'webhook' in blueprint_names
+        assert 'sweep' in blueprint_names
 
     def test_app_config(self):
         """Test app configuration."""

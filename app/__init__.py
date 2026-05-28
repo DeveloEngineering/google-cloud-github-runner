@@ -65,8 +65,10 @@ def create_app():
     # Register blueprints
     from app.routes.setup import setup_bp
     from app.routes.webhook import webhook_bp
+    from app.routes.sweep import sweep_bp
 
     app.register_blueprint(setup_bp)
     app.register_blueprint(webhook_bp)
+    app.register_blueprint(sweep_bp)
 
     return app
