@@ -9,6 +9,17 @@ output "github_runners_orphan_sweeper_job" {
   value = google_cloud_scheduler_job.github_runners_orphan_sweeper.name
 }
 
+# Name of the Cloud Scheduler job that reconciles dropped/timed-out webhooks.
+output "github_runners_reconciler_job" {
+  value = google_cloud_scheduler_job.github_runners_reconciler.name
+}
+
+# Cloud Tasks queue that buffers webhook work between /webhook and
+# /internal/process-workflow-job.
+output "github_runners_workflow_job_queue" {
+  value = google_cloud_tasks_queue.workflow_job_queue.name
+}
+
 # Generate Cloud Build configuration for building the manager container image
 resource "local_file" "cloudbuild-github-runners-manager-config" {
   filename        = "${path.module}/cloudbuild-container.yaml"
@@ -36,6 +47,14 @@ resource "null_resource" "build-github-runners-manager-container" {
     script_hash     = sha256(local_file.cloudbuild-github-runners-manager-script.content)
     config_hash     = sha256(local_file.cloudbuild-github-runners-manager-config.content)
     dockerfile_hash = sha256(file("${path.module}/../Dockerfile"))
+    # Without this, edits to Python source under app/ never trigger a rebuild.
+    # Hash every file under app/ plus requirements.txt so any code or
+    # dependency change forces a fresh image build on the next terraform apply.
+    app_hash = sha256(join("", [
+      for f in sort(fileset("${path.module}/..", "app/**")) :
+      filesha256("${path.module}/../${f}")
+    ]))
+    requirements_hash = filesha256("${path.module}/../requirements.txt")
   }
 
   provisioner "local-exec" {
@@ -90,7 +109,7 @@ resource "null_resource" "build-github-runners-images" {
   for_each = local_file.github-runners-images
 
   triggers = {
-    script_hash    = sha256(each.value.content)
+    script_hash = sha256(each.value.content)
     # Rebuild when startup/install.sh changes. Without this, edits to the
     # startup script update the GCS blob but never re-bake the image.
     install_sh_md5 = filemd5("${path.module}/startup/install.sh")

@@ -50,47 +50,87 @@ class TestIntegrationWorkflow:
         response = client.get('/setup/callback?code=test-code', headers=make_basic_auth_headers())
         assert response.status_code in [200, 302]
 
+    @patch('app.routes.webhook.CloudTasksClient')
     @patch('app.routes.webhook.verify_github_signature')
-    @patch('app.services.webhook_service.GitHubClient')
-    @patch('app.services.webhook_service.GCloudClient')
-    def test_full_webhook_flow(self, mock_gcloud, mock_github, mock_verify, client):
-        """Test complete webhook flow."""
-        from unittest.mock import Mock
+    def test_webhook_enqueues_for_async_processing(
+        self, mock_verify, mock_tasks_cls, client
+    ):
+        """End-to-end /webhook flow: verify signature → enqueue → 202.
 
-        # Mock signature verification
+        The actual processing (registration token + VM create) is exercised in
+        test_routes_internal.py and test_webhook_service.py; here we only
+        check the webhook handler does the right thing before Cloud Tasks
+        takes over.
+        """
         mock_verify.return_value = True
+        mock_tasks = mock_tasks_cls.return_value
 
-        # Setup mocks
-        mock_gh_instance = Mock()
-        mock_gh_instance.get_registration_token.return_value = "test-token"
-        mock_github.return_value = mock_gh_instance
-
-        mock_gc_instance = Mock()
-        mock_gc_instance.create_runner_instance.return_value = "runner-test"
-        mock_gc_instance.find_runner_by_job_id.return_value = None
-        mock_gcloud.return_value = mock_gc_instance
-
-        # Send workflow_job webhook
         payload = {
             'action': 'queued',
-            'workflow_job': {
-                'id': 123,
-                'labels': ['gcp-ubuntu-24.04']
-            },
+            'workflow_job': {'id': 123, 'labels': ['gcp-ubuntu-24.04']},
             'repository': {
                 'html_url': 'https://github.com/owner/repo',
-                'full_name': 'owner/repo'
-            }
+                'full_name': 'owner/repo',
+            },
         }
-
         response = client.post(
             '/webhook',
             data=json.dumps(payload),
             content_type='application/json',
-            headers={'X-GitHub-Event': 'workflow_job'}
+            headers={
+                'X-GitHub-Event': 'workflow_job',
+                'X-GitHub-Delivery': 'integration-delivery-1',
+            },
+        )
+
+        assert response.status_code == 202
+        assert response.json['status'] == 'accepted'
+        mock_tasks.enqueue_workflow_job.assert_called_once()
+        _, kwargs = mock_tasks.enqueue_workflow_job.call_args
+        assert kwargs['payload'] == payload
+        assert kwargs['delivery_id'] == 'integration-delivery-1'
+        assert kwargs['source'] == 'webhook'
+
+    @patch('app.routes.internal.verify_scheduler_oidc_token')
+    @patch('app.services.webhook_service.GitHubClient')
+    @patch('app.services.webhook_service.GCloudClient')
+    def test_internal_route_drives_full_processing(
+        self, mock_gcloud, mock_github, mock_auth, client
+    ):
+        """Once Cloud Tasks delivers, /internal/process-workflow-job runs the
+        same WebhookService logic the old synchronous path used."""
+        from unittest.mock import Mock
+
+        mock_auth.return_value = True
+
+        mock_gh = Mock()
+        mock_gh.get_registration_token.return_value = 'test-token'
+        mock_github.return_value = mock_gh
+
+        mock_gc = Mock()
+        mock_gc.create_runner_instance.return_value = 'runner-test'
+        mock_gc.find_runner_by_job_id.return_value = None
+        mock_gcloud.return_value = mock_gc
+
+        task_body = {
+            'source': 'webhook',
+            'delivery_id': 'integration-delivery-1',
+            'payload': {
+                'action': 'queued',
+                'workflow_job': {'id': 123, 'labels': ['gcp-ubuntu-24.04']},
+                'repository': {
+                    'html_url': 'https://github.com/owner/repo',
+                    'full_name': 'owner/repo',
+                },
+            },
+        }
+        response = client.post(
+            '/internal/process-workflow-job',
+            data=json.dumps(task_body),
+            content_type='application/json',
+            headers={'Authorization': 'Bearer fake-task-token'},
         )
 
         assert response.status_code == 200
-        assert response.json['status'] == 'success'
-        mock_gh_instance.get_registration_token.assert_called_once()
-        mock_gc_instance.create_runner_instance.assert_called_once()
+        mock_gh.get_registration_token.assert_called_once()
+        mock_gc.create_runner_instance.assert_called_once()

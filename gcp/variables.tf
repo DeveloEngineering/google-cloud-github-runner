@@ -7,6 +7,7 @@ variable "apis" {
     "cloudbuild.googleapis.com",
     "cloudresourcemanager.googleapis.com",
     "cloudscheduler.googleapis.com",
+    "cloudtasks.googleapis.com",
     "compute.googleapis.com",
     "iam.googleapis.com",
     "logging.googleapis.com",
@@ -90,7 +91,7 @@ variable "github_runners_manager_min_instance_count" {
   type        = number
   # Keep 3 instances always-on so the first burst of the day doesn't pay
   # cold-start latency. Each adds ~$10-15/month at gen2 idle.
-  default     = 3
+  default = 3
 
   validation {
     condition     = var.github_runners_manager_min_instance_count >= 1
@@ -157,6 +158,33 @@ variable "github_runners_orphan_max_age_seconds" {
   }
 }
 
+# Cron schedule for the reconciler job — finds workflow_jobs that are stuck
+# in queued state with no assigned runner and synthesizes the VM create that
+# a dropped or timed-out workflow_job.queued webhook would have triggered.
+variable "github_runners_reconciler_schedule" {
+  description = "Cloud Scheduler cron expression for the reconciler"
+  type        = string
+  default     = "*/5 * * * *"
+  nullable    = false
+}
+
+# Minimum age a queued workflow_job must reach before the reconciler will
+# create a VM for it. Smaller is more aggressive (catches drops faster) but
+# risks racing with a still-in-flight webhook delivery and creating a second
+# VM (which idempotency on gha-job-id would dedupe, but it's still wasted
+# work). 120 s is conservative.
+variable "github_runners_reconciler_min_job_age_seconds" {
+  description = "Reconciler ignores queued jobs younger than this; protects against racing in-flight webhooks"
+  type        = number
+  default     = 120
+  nullable    = false
+
+  validation {
+    condition     = var.github_runners_reconciler_min_job_age_seconds >= 30
+    error_message = "Reconciler min job age must be at least 30 seconds."
+  }
+}
+
 # Cron schedule for the orphan-runner sweeper job.
 variable "github_runners_orphan_sweep_schedule" {
   description = "Cloud Scheduler cron expression for the orphan-runner sweeper"
@@ -214,8 +242,8 @@ variable "github_runners_default_type" {
   })
   default = {
     amd64 = {
-      instance_type               = "e2-standard-4"
-      disk_type                   = "pd-ssd"
+      instance_type = "e2-standard-4"
+      disk_type     = "pd-ssd"
       # Builder disk needs to fit Ubuntu (~5 GB), Docker + runner (~1.5 GB),
       # baseline apt packages (~0.5 GB), pre-installed Node + Playwright libs +
       # chromium + pre-pulled CI Docker images (~2.5 GB). 10 GB leaves no
@@ -297,11 +325,11 @@ variable "github_runners_types" {
       arch                        = "amd64"
     },
     {
-      name                        = "gcp-ubuntu-slim"
-      instance_type               = "e2-medium"
-      vcpu                        = 2
-      memory                      = 4
-      disk_type                   = "pd-ssd"
+      name          = "gcp-ubuntu-slim"
+      instance_type = "e2-medium"
+      vcpu          = 2
+      memory        = 4
+      disk_type     = "pd-ssd"
       # Must be >= baked image size (30 GB in github_runners_default_type).
       disk_size                   = 30
       disk_provisioned_iops       = 0
@@ -430,11 +458,11 @@ variable "github_runners_types" {
       arch                        = "amd64"
     },
     {
-      name                        = "gcp-ubuntu-slim-arm"
-      instance_type               = "c4a-standard-1"
-      vcpu                        = 1
-      memory                      = 4
-      disk_type                   = "hyperdisk-balanced"
+      name          = "gcp-ubuntu-slim-arm"
+      instance_type = "c4a-standard-1"
+      vcpu          = 1
+      memory        = 4
+      disk_type     = "hyperdisk-balanced"
       # Must be >= baked image size (30 GB in github_runners_default_type).
       disk_size                   = 30
       disk_provisioned_iops       = 3090
