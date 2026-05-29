@@ -88,7 +88,9 @@ variable "github_runners_internal_cidr" {
 variable "github_runners_manager_min_instance_count" {
   description = "GitHub Actions Runners manager app min. instance count (a minimum of one Cloud Run instance is required to avoid GitHub webhook timeout!)"
   type        = number
-  default     = 1
+  # Keep 3 instances always-on so the first burst of the day doesn't pay
+  # cold-start latency. Each adds ~$10-15/month at gen2 idle.
+  default     = 3
 
   validation {
     condition     = var.github_runners_manager_min_instance_count >= 1
@@ -96,11 +98,14 @@ variable "github_runners_manager_min_instance_count" {
   }
 }
 
-# Maximum number of Cloud Run instances for the GitHub Actions Runners manager application
+# Maximum number of Cloud Run instances for the GitHub Actions Runners manager application.
+# Sized so that, combined with max_concurrency, the service has more concurrent
+# webhook slots than any plausible fan-out burst from a CI run. Webhooks past
+# the limit get queued, and p99 latency rises into GitHub's 10s timeout window.
 variable "github_runners_manager_max_instance_count" {
   description = "GitHub Actions Runners manager app maximum instance count (Max. number of Cloud Run instances)"
   type        = number
-  default     = 5
+  default     = 30
 
   validation {
     condition     = var.github_runners_manager_max_instance_count >= var.github_runners_manager_min_instance_count
@@ -111,10 +116,12 @@ variable "github_runners_manager_max_instance_count" {
 # Per-instance concurrency for the Cloud Run service. Lower values cause Cloud Run to
 # scale out sooner under burst webhook traffic; higher values pack more requests into
 # each instance. Each request acquires one gunicorn thread for its full duration.
+# 8 is empirically a good balance: enough that warm instances handle bursts without
+# scaling, low enough that contention doesn't push p99 past GitHub's 10s timeout.
 variable "github_runners_manager_max_concurrency" {
   description = "Maximum concurrent requests per Cloud Run instance for the runners manager"
   type        = number
-  default     = 20
+  default     = 8
 
   validation {
     condition     = var.github_runners_manager_max_concurrency > 0
