@@ -1,7 +1,15 @@
 import pytest
 import logging
 from unittest.mock import patch, MagicMock
-from app.clients.github_client import GitHubClient
+from app.clients.github_client import GitHubClient, _reset_token_cache_for_tests
+
+
+@pytest.fixture(autouse=True)
+def reset_token_cache():
+    """Clear the module-level installation-token cache between tests."""
+    _reset_token_cache_for_tests()
+    yield
+    _reset_token_cache_for_tests()
 
 
 @pytest.fixture
@@ -153,6 +161,74 @@ class TestGitHubClient:
         client = GitHubClient()
         with pytest.raises(Exception, match="Key error"):
             client._generate_jwt()
+
+
+class TestInstallationTokenCaching:
+    """The installation token is cached process-wide and reused until near expiry."""
+
+    @patch('app.clients.github_client.requests.post')
+    @patch.object(GitHubClient, '_generate_jwt')
+    def test_second_call_reuses_cached_token(self, mock_jwt, mock_post, mock_env_vars):
+        """Two GitHubClient instances share the same cached installation token."""
+        mock_jwt.return_value = "JWT"
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            'token': 'CACHED_TOKEN',
+            # 1 hour in the future, well past the 10-minute refresh buffer.
+            'expires_at': '2099-01-01T00:00:00Z',
+        }
+        mock_post.return_value = mock_response
+
+        first = GitHubClient().get_installation_access_token()
+        second = GitHubClient().get_installation_access_token()
+
+        assert first == 'CACHED_TOKEN'
+        assert second == 'CACHED_TOKEN'
+        # Only ONE GitHub API call across both invocations — the second is a cache hit.
+        assert mock_post.call_count == 1
+
+    @patch('app.clients.github_client.requests.post')
+    @patch.object(GitHubClient, '_generate_jwt')
+    def test_expired_cache_refreshes(self, mock_jwt, mock_post, mock_env_vars):
+        """A cached token within the refresh buffer triggers a refresh."""
+        mock_jwt.return_value = "JWT"
+
+        from app.clients import github_client as gc
+        # Prime the cache with a token that "expires in 60s" — inside the
+        # 10-minute refresh buffer, so the next call should mint a fresh one.
+        import time as time_mod
+        with gc._token_cache_lock:
+            gc._token_cache['token'] = 'STALE_TOKEN'
+            gc._token_cache['expires_at'] = time_mod.time() + 60
+
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            'token': 'FRESH_TOKEN',
+            'expires_at': '2099-01-01T00:00:00Z',
+        }
+        mock_post.return_value = mock_response
+
+        token = GitHubClient().get_installation_access_token()
+
+        assert token == 'FRESH_TOKEN'
+        assert mock_post.call_count == 1
+
+    @patch('app.clients.github_client.requests.post')
+    @patch.object(GitHubClient, '_generate_jwt')
+    def test_missing_expires_at_falls_back_to_55min(self, mock_jwt, mock_post, mock_env_vars):
+        """GitHub response without expires_at still produces a valid cache entry."""
+        mock_jwt.return_value = "JWT"
+        mock_response = MagicMock()
+        # No expires_at field — older GitHub Enterprise responses sometimes omit it.
+        mock_response.json.return_value = {'token': 'TOKEN_NO_EXPIRY'}
+        mock_post.return_value = mock_response
+
+        token = GitHubClient().get_installation_access_token()
+        assert token == 'TOKEN_NO_EXPIRY'
+
+        # Second call within a few seconds should hit the cache (55-min fallback).
+        GitHubClient().get_installation_access_token()
+        assert mock_post.call_count == 1
 
 
 class TestGitHubClientDeliveryIdLogging:

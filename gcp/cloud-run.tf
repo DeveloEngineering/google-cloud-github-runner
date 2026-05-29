@@ -23,8 +23,12 @@ module "cloud_run_github_runners_manager" {
       image = data.google_artifact_registry_docker_image.container-image-github-runners-manager.self_link
       resources = {
         limits = {
-          cpu    = "1000m"
-          memory = "512Mi"
+          # 2 vCPU + 1Gi keeps per-request CPU time short under burst —
+          # webhook handler does sequential GitHub-API + GCE-API calls, both
+          # are CPU-bound on JSON+TLS work. Bumping from 1000m fixed a p99
+          # tail that was crossing GitHub's 10s timeout under fan-out bursts.
+          cpu    = "2000m"
+          memory = "1Gi"
         }
         startup_cpu_boost = false # We do not scale to zero.
       }
