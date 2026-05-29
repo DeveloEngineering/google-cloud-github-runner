@@ -202,25 +202,75 @@ if ! id -u runner >/dev/null 2>&1; then
 fi
 sudo usermod -aG docker,google-sudoers runner
 
+# ─── Install GitHub Actions Runner ───────────────────────────────────────────
+# Done EARLY (before any develo optimizations) so the image is always usable
+# as a baseline runner image even if a later optional step fails. If this
+# install fails, the EXIT trap shuts the VM down WITH non-zero exit_code, the
+# image gets snapshotted broken, and runner VMs will fail at startup — but
+# this is rarely flaky compared to npx/docker-pull steps below.
+echo "Installing GitHub Actions Runner..."
+MY_RUNNER_VERSION=$(curl -fsSL "https://api.github.com/repos/actions/runner/releases/latest" | jq -r '.tag_name' | sed 's/^v//')
+if [[ -z "$MY_RUNNER_VERSION" || "$MY_RUNNER_VERSION" == "null" ]]; then
+        exit_with_failure "Could not retrieve the latest GitHub Actions Runner version"
+fi
+echo "Installing GitHub Actions Runner version: v${MY_RUNNER_VERSION}"
+
+sudo mkdir -p "$MY_RUNNER_DIR"
+cd "$MY_RUNNER_DIR"
+sudo curl -fsSL -O "https://github.com/actions/runner/releases/download/v${MY_RUNNER_VERSION}/actions-runner-linux-${MY_ARCH}-${MY_RUNNER_VERSION}.tar.gz"
+sudo tar xzf "actions-runner-linux-${MY_ARCH}-${MY_RUNNER_VERSION}.tar.gz"
+
+# Patch for Ubuntu 24.04 (https://github.com/actions/runner/issues/3150)
+sudo sed -i 's/libicu72/libicu72 libicu74/' ./bin/installdependencies.sh
+
+# Run the installation script
+sudo ./bin/installdependencies.sh
+
+# Sanity-check the runner is fully installed. If config.sh is missing here
+# we want the bake to fail loudly, not produce a broken image silently.
+[[ -x "$MY_RUNNER_DIR/config.sh" && -x "$MY_RUNNER_DIR/run.sh" ]] || \
+        exit_with_failure "GitHub Actions Runner install failed: $MY_RUNNER_DIR/{config.sh,run.sh} missing"
+echo "GitHub Actions Runner installed successfully"
+
+# Marker file so we can grep for it on a baked image to confirm runner install
+# made it in. Future operators (or a verification step in build-image.sh) can
+# look for this file before promoting an image.
+sudo install -m 0644 /dev/null /etc/develo-runner-image-ready
+echo "runner_installed=1" | sudo tee -a /etc/develo-runner-image-ready >/dev/null
+
+# Helper: run a develo optimization block with errors logged but NOT fatal.
+# Every block below is OPTIONAL — failures should leave a degraded-but-working
+# baseline runner image, never a broken one missing /actions-runner.
+develo_optional() {
+        local label="$1"; shift
+        echo "─── develo optional: ${label} ───"
+        if ! ( set -euo pipefail; "$@" ); then
+                echo "  WARN: develo optional step '${label}' failed; continuing with degraded image" >&2
+        fi
+}
+
 # ─── develo CI customizations: pre-install Node 24 in tool cache ─────────────
 # actions/setup-node@v4 looks for Node at $RUNNER_TOOL_CACHE/node/<ver>/<arch>.
 # Pre-populating it turns the setup-node step from a ~10s download into a ~1s
 # cache hit. DEVELO_NODE_ARCH is the Node release naming (x64/arm64), NOT
 # the dpkg architecture name.
-echo "Pre-installing Node ${DEVELO_NODE_VERSION} in tool cache..."
 DEVELO_NODE_ARCH=$([ "${MY_ARCH}" = "arm64" ] && echo "arm64" || echo "x64")
 DEVELO_TOOL_CACHE="/opt/hostedtoolcache"
 DEVELO_NODE_DIR="${DEVELO_TOOL_CACHE}/node/${DEVELO_NODE_VERSION}/${DEVELO_NODE_ARCH}"
-sudo mkdir -p "${DEVELO_NODE_DIR}"
-curl -fsSL "https://nodejs.org/dist/v${DEVELO_NODE_VERSION}/node-v${DEVELO_NODE_VERSION}-linux-${DEVELO_NODE_ARCH}.tar.xz" \
-        | sudo tar -xJ --strip-components=1 -C "${DEVELO_NODE_DIR}"
-# Marker file that actions/setup-node checks for cache validity
-sudo touch "${DEVELO_TOOL_CACHE}/node/${DEVELO_NODE_VERSION}/${DEVELO_NODE_ARCH}.complete"
-# System-wide PATH for any non-setup-node consumers
-sudo ln -sf "${DEVELO_NODE_DIR}/bin/node"     /usr/local/bin/node
-sudo ln -sf "${DEVELO_NODE_DIR}/bin/npm"      /usr/local/bin/npm
-sudo ln -sf "${DEVELO_NODE_DIR}/bin/npx"      /usr/local/bin/npx
-sudo ln -sf "${DEVELO_NODE_DIR}/bin/corepack" /usr/local/bin/corepack
+
+develo_install_node() {
+        sudo mkdir -p "${DEVELO_NODE_DIR}"
+        curl -fsSL "https://nodejs.org/dist/v${DEVELO_NODE_VERSION}/node-v${DEVELO_NODE_VERSION}-linux-${DEVELO_NODE_ARCH}.tar.xz" \
+                | sudo tar -xJ --strip-components=1 -C "${DEVELO_NODE_DIR}"
+        # Marker file that actions/setup-node checks for cache validity
+        sudo touch "${DEVELO_TOOL_CACHE}/node/${DEVELO_NODE_VERSION}/${DEVELO_NODE_ARCH}.complete"
+        # System-wide PATH for any non-setup-node consumers
+        sudo ln -sf "${DEVELO_NODE_DIR}/bin/node"     /usr/local/bin/node
+        sudo ln -sf "${DEVELO_NODE_DIR}/bin/npm"      /usr/local/bin/npm
+        sudo ln -sf "${DEVELO_NODE_DIR}/bin/npx"      /usr/local/bin/npx
+        sudo ln -sf "${DEVELO_NODE_DIR}/bin/corepack" /usr/local/bin/corepack
+}
+develo_optional "pre-install Node ${DEVELO_NODE_VERSION} in tool cache" develo_install_node
 
 # Pre-download the exact yarn version develo-emr uses so the first CI
 # `yarn ...` invocation doesn't fetch it. Combined with the
@@ -236,48 +286,53 @@ sudo ln -sf "${DEVELO_NODE_DIR}/bin/corepack" /usr/local/bin/corepack
 # Do NOT add a fallback `ln -sf "${DEVELO_NODE_DIR}/bin/yarn" /usr/local/bin/yarn`
 # here — that would overwrite the real shim with a broken symlink to a
 # file corepack does NOT create in the Node bin dir.
-sudo corepack enable yarn
-sudo COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare "yarn@${DEVELO_YARN_VERSION}" --activate
-
-# Pre-warm the runner user's corepack cache so the first CI yarn invocation
-# doesn't re-download yarn 4.14.1 (cache is per-user; root's cache from
-# above doesn't help the runner user).
-sudo -u runner -E env \
-        HOME="/home/runner" \
-        PATH="/usr/local/bin:${PATH}" \
-        COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
-        corepack prepare "yarn@${DEVELO_YARN_VERSION}" --activate
-
-sudo chown -R runner:runner "${DEVELO_TOOL_CACHE}"
+develo_install_yarn() {
+        sudo corepack enable yarn
+        sudo COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack prepare "yarn@${DEVELO_YARN_VERSION}" --activate
+        # Pre-warm the runner user's corepack cache so the first CI yarn invocation
+        # doesn't re-download yarn 4.14.1 (cache is per-user; root's cache from
+        # above doesn't help the runner user).
+        sudo -u runner -E env \
+                HOME="/home/runner" \
+                PATH="/usr/local/bin:${PATH}" \
+                COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+                corepack prepare "yarn@${DEVELO_YARN_VERSION}" --activate
+        sudo chown -R runner:runner "${DEVELO_TOOL_CACHE}"
+}
+develo_optional "pre-install yarn ${DEVELO_YARN_VERSION} via corepack" develo_install_yarn
 
 # ─── develo CI customizations: Playwright chromium runtime libs ──────────────
 # Pre-installs the system deps `playwright install --with-deps chromium` would
 # pull. With these baked in, CI can drop --with-deps. apt-mark hold prevents
 # future apt-gets from swapping versions.
-echo "Installing Playwright chromium runtime libs..."
-DEVELO_PLAYWRIGHT_LIBS=(
-        libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64
-        libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2
-        libgbm1 libpango-1.0-0 libcairo2 libasound2t64
-)
-sudo apt-get install -y --no-install-recommends "${DEVELO_PLAYWRIGHT_LIBS[@]}"
-sudo apt-mark hold "${DEVELO_PLAYWRIGHT_LIBS[@]}" 2>/dev/null || true
+develo_install_playwright_libs() {
+        local DEVELO_PLAYWRIGHT_LIBS=(
+                libnss3 libnspr4 libatk1.0-0t64 libatk-bridge2.0-0t64 libcups2t64
+                libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2
+                libgbm1 libpango-1.0-0 libcairo2 libasound2t64
+        )
+        sudo apt-get install -y --no-install-recommends "${DEVELO_PLAYWRIGHT_LIBS[@]}"
+        sudo apt-mark hold "${DEVELO_PLAYWRIGHT_LIBS[@]}" 2>/dev/null || true
+}
+develo_optional "Playwright chromium runtime libs" develo_install_playwright_libs
 
 # ─── develo CI customizations: pre-install Playwright chromium browser ───────
 # Cache the browser binary at the runner user's standard Playwright cache
 # location so the CI `playwright install chromium` step is a no-op.
 # Coupled to DEVELO_PLAYWRIGHT_VERSION — if e2e/package.json bumps
 # @playwright/test, CI falls back to runtime download (same as today).
-echo "Pre-installing Playwright ${DEVELO_PLAYWRIGHT_VERSION} chromium browser..."
-sudo -u runner -E env \
-        HOME="/home/runner" \
-        PATH="/usr/local/bin:${PATH}" \
-        bash -c "
-                set -euo pipefail
-                export PLAYWRIGHT_BROWSERS_PATH=\$HOME/.cache/ms-playwright
-                mkdir -p \"\$PLAYWRIGHT_BROWSERS_PATH\"
-                npx --yes playwright@${DEVELO_PLAYWRIGHT_VERSION} install chromium
-        "
+develo_install_playwright_browser() {
+        sudo -u runner -E env \
+                HOME="/home/runner" \
+                PATH="/usr/local/bin:${PATH}" \
+                bash -c "
+                        set -euo pipefail
+                        export PLAYWRIGHT_BROWSERS_PATH=\$HOME/.cache/ms-playwright
+                        mkdir -p \"\$PLAYWRIGHT_BROWSERS_PATH\"
+                        npx --yes playwright@${DEVELO_PLAYWRIGHT_VERSION} install chromium
+                "
+}
+develo_optional "Playwright ${DEVELO_PLAYWRIGHT_VERSION} chromium browser" develo_install_playwright_browser
 
 # ─── develo CI customizations: pre-pull CI service-container Docker images ───
 # Saves ~30s per playwright shard. Requires the builder VM's service account
@@ -286,11 +341,14 @@ sudo -u runner -E env \
 # roles/artifactregistry.reader on ${DEVELO_AR_PROJECT}. Pull failures are
 # logged but don't fail the build — runner VMs would just fall back to
 # pulling at job time.
-echo "Pre-pulling CI Docker images..."
-if command -v gcloud >/dev/null 2>&1; then
+develo_prepull_images() {
+        if ! command -v gcloud >/dev/null 2>&1; then
+                echo "  WARN: gcloud not installed on builder VM; skipping AR image pre-pull"
+                return 0
+        fi
         sudo gcloud auth configure-docker "${DEVELO_AR_REGISTRY}" --quiet || \
                 echo "  WARN: gcloud auth configure-docker failed; AR pulls may be skipped"
-        DEVELO_IMAGES=(
+        local DEVELO_IMAGES=(
                 "postgres:14"
                 "redis"
                 "public.ecr.aws/localstack/localstack:4.14.0"
@@ -303,30 +361,8 @@ if command -v gcloud >/dev/null 2>&1; then
                 echo "  pulling ${IMG}"
                 sudo docker pull "${IMG}" || echo "  WARN: pull failed for ${IMG} (will fall back to runtime pull)"
         done
-else
-        echo "  WARN: gcloud not installed on builder VM; skipping AR image pre-pull"
-fi
-
-# Install GitHub Actions Runner
-echo "Installing GitHub Actions Runner..."
-MY_RUNNER_VERSION=$(curl -fsSL "https://api.github.com/repos/actions/runner/releases/latest" | jq -r '.tag_name' | sed 's/^v//')
-if [[ -z "$MY_RUNNER_VERSION" || "$MY_RUNNER_VERSION" == "null" ]]; then
-        exit_with_failure "Could not retrieve the latest GitHub Actions Runner version"
-fi
-echo "Installing GitHub Actions Runner version: v${MY_RUNNER_VERSION}"
-
-# Download and extract runner
-sudo mkdir -p "$MY_RUNNER_DIR"
-cd "$MY_RUNNER_DIR"
-sudo curl -fsSL -O "https://github.com/actions/runner/releases/download/v${MY_RUNNER_VERSION}/actions-runner-linux-${MY_ARCH}-${MY_RUNNER_VERSION}.tar.gz"
-sudo tar xzf "actions-runner-linux-${MY_ARCH}-${MY_RUNNER_VERSION}.tar.gz"
-
-# Patch for Ubuntu 24.04 (https://github.com/actions/runner/issues/3150)
-sudo sed -i 's/libicu72/libicu72 libicu74/' ./bin/installdependencies.sh
-
-# Run the installation script
-sudo ./bin/installdependencies.sh
-echo "GitHub Actions Runner installed successfully"
+}
+develo_optional "pre-pull CI service-container Docker images" develo_prepull_images
 
 # Cleanup: Clear package cache and temporary files
 echo "Cleaning up..."
