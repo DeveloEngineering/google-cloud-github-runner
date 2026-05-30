@@ -164,7 +164,7 @@ variable "github_runners_orphan_max_age_seconds" {
 variable "github_runners_reconciler_schedule" {
   description = "Cloud Scheduler cron expression for the reconciler"
   type        = string
-  default     = "*/5 * * * *"
+  default     = "*/2 * * * *"
   nullable    = false
 }
 
