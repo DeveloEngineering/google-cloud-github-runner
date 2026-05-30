@@ -37,10 +37,27 @@ module "cloud_run_github_runners_manager" {
         GOOGLE_CLOUD_ZONE                     = "${var.region}-${var.zone}"
         GITHUB_RUNNER_GROUP                   = var.github_runner_group
         GITHUB_RUNNERS_ORPHAN_MAX_AGE_SECONDS = tostring(var.github_runners_orphan_max_age_seconds)
-        # Service account email Cloud Scheduler signs OIDC tokens with when
-        # invoking /sweep. The app verifies the token's email claim against
-        # this value to authenticate sweeper requests.
+        # Service account email Cloud Scheduler uses to OIDC-sign /sweep and
+        # /reconcile invocations. The app verifies the token's email claim
+        # against this value.
         SWEEP_OIDC_SERVICE_ACCOUNT_EMAIL = module.service-account-cloud-scheduler-sweeper.email
+        # Service account email Cloud Tasks uses to OIDC-sign deliveries to
+        # /internal/process-workflow-job. Distinct from the sweeper SA so
+        # Cloud Run can grant actAs separately to each.
+        INTERNAL_OIDC_SERVICE_ACCOUNT_EMAIL = module.service-account-cloud-tasks-invoker.email
+        # Cloud Tasks config — webhook handler enqueues work here and the
+        # /internal/process-workflow-job route consumes it. See cloud-tasks.tf.
+        TASKS_QUEUE_PROJECT                 = var.project_id
+        TASKS_QUEUE_LOCATION                = var.region
+        TASKS_QUEUE_NAME                    = google_cloud_tasks_queue.workflow_job_queue.name
+        TASKS_INVOKER_SERVICE_ACCOUNT_EMAIL = module.service-account-cloud-tasks-invoker.email
+        # NOTE: Task target URL is NOT passed as an env var — that would
+        # create a circular dependency (the env block of cloud_run referencing
+        # cloud_run's own service_uri output). The handler reads its own
+        # service URL from the incoming request's Host header at runtime.
+        # Reconciler config — minimum age before reconciler will act on a
+        # stuck job. Protects against racing in-flight webhook deliveries.
+        GITHUB_RECONCILER_MIN_JOB_AGE_SECONDS = tostring(var.github_runners_reconciler_min_job_age_seconds)
       }
       env_from_key = {
         GITHUB_APP_ID = {
@@ -91,6 +108,8 @@ module "cloud_run_github_runners_manager" {
   depends_on = [
     google_secret_manager_secret_version.secret-version-default,
     time_sleep.wait_for_service_account_cloud_run,
-    time_sleep.wait_for_service_account_cloud_scheduler
+    time_sleep.wait_for_service_account_cloud_scheduler,
+    time_sleep.wait_for_service_account_cloud_tasks_invoker,
+    google_cloud_tasks_queue.workflow_job_queue,
   ]
 }

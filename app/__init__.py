@@ -66,9 +66,13 @@ def create_app():
     from app.routes.setup import setup_bp
     from app.routes.webhook import webhook_bp
     from app.routes.sweep import sweep_bp
+    from app.routes.internal import internal_bp
+    from app.routes.reconcile import reconcile_bp
 
     app.register_blueprint(setup_bp)
     app.register_blueprint(webhook_bp)
     app.register_blueprint(sweep_bp)
+    app.register_blueprint(internal_bp)
+    app.register_blueprint(reconcile_bp)
 
     return app

@@ -38,8 +38,38 @@ module "service-account-cloud-run-github-runners-manager" {
       "roles/compute.admin",
       "roles/logging.logWriter",
       "roles/monitoring.metricWriter",
+      # Lets the webhook handler enqueue tasks onto the Cloud Tasks queue.
+      "roles/cloudtasks.enqueuer",
+      # Lets the webhook handler attach an OIDC token (signed by the tasks
+      # invoker SA) to enqueued tasks. The actAs binding is granted on the
+      # invoker SA below.
     ]
   }
+}
+
+# Service Account that Cloud Tasks impersonates when delivering tasks back to
+# the Cloud Run service. The /internal/process-workflow-job route verifies
+# the OIDC token's email claim against this SA.
+module "service-account-cloud-tasks-invoker" {
+  source       = "git::https://github.com/GoogleCloudPlatform/cloud-foundation-fabric//modules/iam-service-account?ref=v53.0.0"
+  project_id   = module.project.project_id
+  name         = "github-runners-tasks-invoker"
+  display_name = "Cloud Tasks - Webhook task dispatcher (Terraform managed)"
+  # The runners-manager SA must be able to "actAs" this SA in order to attach
+  # OIDC tokens signed by it to enqueued tasks.
+  iam = {
+    "roles/iam.serviceAccountUser" = [
+      module.service-account-cloud-run-github-runners-manager.iam_email
+    ]
+  }
+}
+
+# Wait for service account to be fully propagated in Google Cloud IAM
+resource "time_sleep" "wait_for_service_account_cloud_tasks_invoker" {
+  depends_on = [
+    module.service-account-cloud-tasks-invoker
+  ]
+  create_duration = "30s"
 }
 
 # Wait for service account to be fully propagated in Google Cloud IAM
@@ -50,15 +80,16 @@ resource "time_sleep" "wait_for_service_account_cloud_run" {
   create_duration = "30s"
 }
 
-# Service Account for Cloud Scheduler to invoke the orphan-runner sweeper.
-# This SA does not need any project roles: the Cloud Run service authorizes
-# requests at the app layer by verifying the OIDC token's email claim against
-# SWEEP_OIDC_SERVICE_ACCOUNT_EMAIL.
+# Service Account for Cloud Scheduler to invoke periodic background jobs
+# (orphan-runner sweeper at /sweep, reconciler at /reconcile). This SA does
+# not need any project roles: the Cloud Run service authorizes requests at
+# the app layer by verifying the OIDC token's email claim against
+# INTERNAL_OIDC_SERVICE_ACCOUNT_EMAIL.
 module "service-account-cloud-scheduler-sweeper" {
   source       = "git::https://github.com/GoogleCloudPlatform/cloud-foundation-fabric//modules/iam-service-account?ref=v53.0.0"
   project_id   = module.project.project_id
   name         = "github-runners-sweeper"
-  display_name = "Cloud Scheduler - Orphan runner sweeper (Terraform managed)"
+  display_name = "Cloud Scheduler - Periodic background jobs (Terraform managed)"
 }
 
 # Wait for service account to be fully propagated in Google Cloud IAM
