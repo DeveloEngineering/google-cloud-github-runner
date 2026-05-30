@@ -1,29 +1,43 @@
 """
-Reconciler — defense in depth against dropped or timed-out webhooks.
+Reconciler — capacity-aware safety net for the webhook path.
 
-GitHub does not auto-retry workflow_job webhook deliveries. Under burst
-fan-out a small fraction (~0.1 %) of deliveries are either dropped on
-GitHub's side or terminated at the 10-second timeout, leaving a workflow_job
-permanently in ``queued`` state with no runner ever attached.
+The PRIMARY mechanism for spinning up runners is the webhook path
+(/webhook -> Cloud Tasks -> /internal -> instances.insert). The reconciler
+exists ONLY to recover the rare job whose ``workflow_job.queued`` webhook was
+never delivered or never produced a VM. In steady state it should enqueue
+zero jobs.
 
-The reconciler runs on a Cloud Scheduler cron (~every 5 min, see
-``scheduler.tf``). For each repository in the GitHub App installation it
-enumerates currently-queued and in-progress workflow runs, filters down to
-``status: queued`` jobs that:
+Capacity-aware design (why it's not per-job-id)
+-----------------------------------------------
+GitHub dispatches a queued job to ANY idle runner that matches its labels —
+not to the specific VM we created "for" that job — and our runners are
+ephemeral (deleted on job completion). So a job sitting in ``queued`` during a
+fan-out usually just means "waiting its turn for a runner", NOT "my webhook
+was dropped". A naive per-job check ("is there a VM tagged with THIS job_id?")
+can't tell those apart and re-creates VMs for jobs that are simply waiting,
+over-provisioning the fleet every pass.
 
-  * are older than ``GITHUB_RECONCILER_MIN_JOB_AGE_SECONDS`` (avoids racing
-    in-flight webhook deliveries that may still arrive on their own);
-  * carry a ``gcp-*`` (or ``dependabot``) runner label;
-  * do not yet have a runner VM tagged with their ``gha-job-id`` label.
+Instead the reconciler reasons about supply vs demand per runner label:
 
-For each surviving job the reconciler synthesises the workflow_job payload
-that the missing webhook *would* have carried and enqueues a Cloud Tasks
-task identical to one a webhook would have produced — same downstream code
-path, full idempotency from the existing ``gha-job-id`` VM label.
+  demand(label)  = # of queued, old-enough, gcp-labelled jobs needing `label`
+  supply(label)  = # of live VMs (PROVISIONING/STAGING/RUNNING) tagged
+                   gha-runner=`label` — i.e. runners already booting or busy
+  deficit(label) = max(0, demand - supply)
+
+It enqueues exactly ``deficit`` VM-creates for the oldest queued jobs of that
+label. Because booting VMs count as supply, VMs created by the webhook path
+(or a previous reconciler pass) suppress further creation — so the reconciler
+only acts when real demand genuinely exceeds the live fleet, which is the
+signature of an actually-missed webhook.
+
+The reconciler runs on a Cloud Scheduler cron (see ``scheduler.tf``). It only
+considers jobs older than ``GITHUB_RECONCILER_MIN_JOB_AGE_SECONDS`` so it does
+not race in-flight webhook deliveries that may still arrive on their own.
 """
 import logging
 import os
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Iterable, List, Optional
 
@@ -69,7 +83,13 @@ class ReconcilerService:
             self.min_age_seconds = DEFAULT_MIN_AGE_SECONDS
 
     def reconcile(self, target_url: str) -> dict:
-        """Run one reconciliation pass.
+        """Run one capacity-aware reconciliation pass.
+
+        Phase 1: enumerate all eligible (queued + old + gcp-labelled) jobs
+                 across every repo in the installation, grouped by runner label.
+        Phase 2: count live runner VMs per label (booting VMs count as supply).
+        Phase 3: for each label, enqueue VM-creates for only the *deficit*
+                 (demand - supply) oldest jobs — never one-per-stuck-job.
 
         Args:
             target_url: absolute URL of /internal/process-workflow-job; tasks
@@ -77,9 +97,7 @@ class ReconcilerService:
                 the URL is request-derived (see ``app.routes.webhook``).
 
         Returns:
-            dict summary with keys ``repos_scanned``, ``runs_scanned``,
-            ``jobs_inspected``, ``jobs_enqueued``, ``jobs_skipped_young``,
-            ``jobs_skipped_no_label``, ``jobs_skipped_vm_exists``, ``errors``.
+            dict summary including per-label demand/supply/deficit.
         """
         token = self.github_client.get_installation_access_token()
         headers = {
@@ -95,12 +113,18 @@ class ReconcilerService:
             'jobs_enqueued': 0,
             'jobs_skipped_young': 0,
             'jobs_skipped_no_label': 0,
-            'jobs_skipped_vm_exists': 0,
+            'jobs_skipped_have_capacity': 0,
             'errors': 0,
+            'by_label': {},
             'enqueued_job_ids': [],
         }
 
         now = time.time()
+
+        # ── Phase 1: collect eligible queued jobs, grouped by runner label ──
+        # Each entry is (job, repo, owner_type) so we can synthesise an
+        # accurate payload (registration token needs repo/org context).
+        demand_by_label = defaultdict(list)
 
         for repo in self._list_installation_repos(headers):
             result['repos_scanned'] += 1
@@ -119,32 +143,54 @@ class ReconcilerService:
 
                 for job in jobs:
                     result['jobs_inspected'] += 1
-                    decision = self._decide(job, now)
-                    if decision == 'young':
+                    eligibility = self._classify(job, now)
+                    if eligibility == 'young':
                         result['jobs_skipped_young'] += 1
-                        continue
-                    if decision == 'no_label':
+                    elif eligibility == 'no_label':
                         result['jobs_skipped_no_label'] += 1
-                        continue
-                    if decision == 'vm_exists':
-                        result['jobs_skipped_vm_exists'] += 1
-                        continue
-                    # decision == 'enqueue'
-                    try:
-                        self._enqueue_synthetic_workflow_job(
-                            target_url=target_url,
-                            job=job,
-                            repo=repo,
-                            owner_type=owner_type,
-                        )
-                        result['jobs_enqueued'] += 1
-                        result['enqueued_job_ids'].append(job.get('id'))
-                    except Exception as e:
-                        logger.error(
-                            "Failed to enqueue reconciler task for job %s: %s",
-                            job.get('id'), e,
-                        )
-                        result['errors'] += 1
+                    elif eligibility == 'eligible':
+                        label = self._gcp_label(job)
+                        demand_by_label[label].append((job, repo, owner_type))
+
+        # ── Phase 2: live supply per label (one GCE list call) ──
+        try:
+            supply_by_label = self.gcloud_client.count_live_runners_by_label()
+        except Exception as e:
+            logger.error("Reconciler could not count live runners: %s", e)
+            result['errors'] += 1
+            supply_by_label = {}
+
+        # ── Phase 3: enqueue only the deficit, oldest-first ──
+        for label, items in demand_by_label.items():
+            demand = len(items)
+            supply = supply_by_label.get(label, 0)
+            deficit = max(0, demand - supply)
+            result['by_label'][label] = {
+                'demand': demand, 'supply': supply, 'deficit': deficit,
+            }
+            if deficit == 0:
+                result['jobs_skipped_have_capacity'] += demand
+                continue
+
+            # Oldest jobs first — bounds worst-case wait for any single job.
+            items.sort(key=lambda t: t[0].get('created_at') or '')
+            result['jobs_skipped_have_capacity'] += (demand - deficit)
+            for job, repo, owner_type in items[:deficit]:
+                try:
+                    self._enqueue_synthetic_workflow_job(
+                        target_url=target_url,
+                        job=job,
+                        repo=repo,
+                        owner_type=owner_type,
+                    )
+                    result['jobs_enqueued'] += 1
+                    result['enqueued_job_ids'].append(job.get('id'))
+                except Exception as e:
+                    logger.error(
+                        "Failed to enqueue reconciler task for job %s: %s",
+                        job.get('id'), e,
+                    )
+                    result['errors'] += 1
 
         logger.info("Reconcile pass: %s", result)
         return result
@@ -185,28 +231,35 @@ class ReconcilerService:
     # Decision + synthesis
     # ------------------------------------------------------------------
 
-    def _decide(self, job: dict, now: float) -> str:
-        """Decide whether to enqueue, skip, or pass on a single job."""
+    @staticmethod
+    def _gcp_label(job: dict) -> Optional[str]:
+        """Return the gcp-/dependabot runner label of a job, or None."""
+        for lbl in (job.get('labels') or []):
+            if lbl.startswith('gcp-') or lbl.lower() == 'dependabot':
+                return lbl
+        return None
+
+    def _classify(self, job: dict, now: float) -> str:
+        """Classify a job as 'eligible', 'young', or 'no_label'.
+
+        Eligibility here means only "is this a queued, old-enough, gcp-labelled
+        job that COULD need a runner". Whether it ACTUALLY needs a new VM is
+        decided later in reconcile() by comparing per-label demand to live
+        supply — never per job-id, because GitHub assigns jobs to arbitrary
+        matching runners.
+        """
         if job.get('status') != 'queued':
-            return 'no_label'  # not queued — implicitly not our problem
-        labels = job.get('labels') or []
-        if not any(
-            (lbl.startswith('gcp-') or lbl.lower() == 'dependabot') for lbl in labels
-        ):
+            return 'no_label'  # not queued — not our concern
+        if self._gcp_label(job) is None:
             return 'no_label'
 
         started = _parse_iso8601_to_epoch(job.get('started_at') or '')
-        # GitHub's `started_at` for a queued job is the time the job entered
-        # the queue. If we can't parse it, treat as too-young to be safe.
+        # GitHub's `started_at` for a queued job is when it entered the queue.
+        # If unparseable, treat as too-young to be safe (avoid racing webhooks).
         if started is None or (now - started) < self.min_age_seconds:
             return 'young'
 
-        # A VM tagged with this job_id already exists? Then a webhook (or a
-        # prior reconcile pass) already created it; do nothing.
-        if self.gcloud_client.find_runner_by_job_id(job.get('id')) is not None:
-            return 'vm_exists'
-
-        return 'enqueue'
+        return 'eligible'
 
     def _enqueue_synthetic_workflow_job(self, target_url, job, repo, owner_type):
         """Synthesise the workflow_job payload a missing webhook would have carried."""

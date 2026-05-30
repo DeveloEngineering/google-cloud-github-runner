@@ -182,6 +182,36 @@ class TestGCloudClient:
             client.delete_runner_instance('runner-12345')
 
     @patch('app.clients.gcloud_client.compute_v1')
+    def test_count_live_runners_by_label(self, mock_compute, mock_env_vars):
+        """Counts non-terminating runner VMs grouped by gha-runner label."""
+        def _inst(name, status, runner_label):
+            m = MagicMock()
+            m.name = name
+            m.status = status
+            m.labels = {'gha-runner': runner_label} if runner_label else {}
+            return m
+
+        instances = [
+            _inst('gcp-runner-1', 'RUNNING', 'gcp-ubuntu-24-04-8core-arm'),
+            _inst('gcp-runner-2', 'PROVISIONING', 'gcp-ubuntu-24-04-8core-arm'),
+            _inst('gcp-runner-3', 'STAGING', 'gcp-ubuntu-24-04-4core-arm'),
+            _inst('gcp-runner-4', 'STOPPING', 'gcp-ubuntu-24-04-8core-arm'),  # not live
+            _inst('gcp-runner-5', 'TERMINATED', 'gcp-ubuntu-24-04-4core-arm'),  # not live
+            _inst('gcp-runner-6', 'RUNNING', None),  # no label → ignored
+        ]
+        mock_instance_client = MagicMock()
+        mock_instance_client.list.return_value = iter(instances)
+        mock_compute.InstancesClient.return_value = mock_instance_client
+
+        client = GCloudClient()
+        counts = client.count_live_runners_by_label()
+
+        assert counts == {
+            'gcp-ubuntu-24-04-8core-arm': 2,  # RUNNING + PROVISIONING (STOPPING excluded)
+            'gcp-ubuntu-24-04-4core-arm': 1,  # STAGING (TERMINATED excluded)
+        }
+
+    @patch('app.clients.gcloud_client.compute_v1')
     def test_get_template_name_found(self, mock_compute, mock_env_vars):
         """Test finding a template by prefix."""
         mock_templates_client = MagicMock()

@@ -265,6 +265,31 @@ class GCloudClient:
                 return instance
         return None
 
+    # GCE instance states that represent a runner that is either already
+    # serving a job or on its way to serving one. A VM in any of these states
+    # counts as "live supply" for capacity planning — including PROVISIONING
+    # and STAGING (still booting), so the reconciler does not double-create
+    # VMs for jobs whose runner is still coming up.
+    _LIVE_STATES = frozenset({'PROVISIONING', 'STAGING', 'RUNNING', 'REPAIRING'})
+
+    def count_live_runners_by_label(self):
+        """
+        Count non-terminating runner VMs grouped by their ``gha-runner`` label
+        (which equals the GitHub ``runs-on`` label the VM was created for).
+
+        Returns:
+            dict[str, int]: e.g. {'gcp-ubuntu-24-04-8core-arm': 12, ...}.
+            VMs without a gha-runner label (shouldn't happen) are ignored.
+        """
+        counts = {}
+        for instance in self.list_runner_instances():
+            if instance.status not in self._LIVE_STATES:
+                continue
+            label = instance.labels.get('gha-runner')
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+        return counts
+
     @staticmethod
     def instance_age_seconds(instance):
         """
