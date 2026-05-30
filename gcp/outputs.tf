@@ -36,6 +36,14 @@ resource "null_resource" "build-github-runners-manager-container" {
     script_hash     = sha256(local_file.cloudbuild-github-runners-manager-script.content)
     config_hash     = sha256(local_file.cloudbuild-github-runners-manager-config.content)
     dockerfile_hash = sha256(file("${path.module}/../Dockerfile"))
+    # Without this, edits to Python source under app/ never trigger a rebuild.
+    # Hash every file under app/ plus requirements.txt so any code or
+    # dependency change forces a fresh image build on the next terraform apply.
+    app_hash = sha256(join("", [
+      for f in sort(fileset("${path.module}/..", "app/**")) :
+      filesha256("${path.module}/../${f}")
+    ]))
+    requirements_hash = filesha256("${path.module}/../requirements.txt")
   }
 
   provisioner "local-exec" {
