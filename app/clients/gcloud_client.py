@@ -33,6 +33,11 @@ class GCloudClient:
         self.zone = os.environ.get('GOOGLE_CLOUD_ZONE', 'us-central1-a')
         self.github_runner_group = os.environ.get('GITHUB_RUNNER_GROUP', '').strip()
         self.region = '-'.join(self.zone.split('-')[:-1])
+        # When true, runners register with --ephemeral and are deleted after one
+        # job. When false (default), runners stay registered and serve multiple
+        # jobs; the sweeper reaps idle ones. Reusing runners avoids paying
+        # cold-boot per job and dramatically cuts VM create churn under bursts.
+        self.ephemeral = os.environ.get('RUNNER_EPHEMERAL', 'false').strip().lower() == 'true'
 
         if not self.project_id:
             logger.warning("GOOGLE_CLOUD_PROJECT not set. GCloudClient will not work correctly.")
@@ -146,6 +151,7 @@ class GCloudClient:
         if self.github_runner_group:
             runner_group_flag = f" --runnergroup {shlex.quote(self.github_runner_group)}"
 
+        ephemeral_flag = "--ephemeral " if self.ephemeral else ""
         startup_script = (
             "cd /actions-runner && "
             f"sudo -u runner ./config.sh --url {shlex.quote(repo_url)} "
@@ -153,7 +159,7 @@ class GCloudClient:
             f"--name {shlex.quote(instance_name)} "
             f"--labels {shlex.quote(template_name)} "
             f"{runner_group_flag} "
-            "--ephemeral "
+            f"{ephemeral_flag}"
             "--unattended "
             "--no-default-labels "
             "--disableupdate && "
@@ -281,12 +287,35 @@ class GCloudClient:
             dict[str, int]: e.g. {'gcp-ubuntu-24-04-8core-arm': 12, ...}.
             VMs without a gha-runner label (shouldn't happen) are ignored.
         """
+        return self.count_supply_by_label(inflight_window_seconds=0)
+
+    def count_supply_by_label(self, inflight_window_seconds=180):
+        """
+        Count runner VMs that represent current-or-imminent capacity, grouped
+        by ``gha-runner`` label.
+
+        A VM counts as supply if it is in a live state (PROVISIONING/STAGING/
+        RUNNING/REPAIRING) OR it was created within ``inflight_window_seconds``
+        (it is in the create→boot→register pipeline and will serve a job
+        shortly). Counting the in-flight pipeline is what stops the reconciler
+        from re-creating, every pass, the VMs it created in the previous pass —
+        the root cause of burst over-provisioning.
+
+        Args:
+            inflight_window_seconds: treat VMs younger than this as supply even
+                if not yet live. 0 disables the in-flight grace (live-only).
+        """
         counts = {}
         for instance in self.list_runner_instances():
-            if instance.status not in self._LIVE_STATES:
-                continue
             label = instance.labels.get('gha-runner')
-            if label:
+            if not label:
+                continue
+            is_live = instance.status in self._LIVE_STATES
+            is_inflight = False
+            if inflight_window_seconds > 0 and instance.status != 'TERMINATED':
+                age = self.instance_age_seconds(instance)
+                is_inflight = age is not None and age < inflight_window_seconds
+            if is_live or is_inflight:
                 counts[label] = counts.get(label, 0) + 1
         return counts
 

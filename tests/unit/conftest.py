@@ -39,10 +39,13 @@ def mock_gcloud_client():
     """Mock GCloudClient for testing."""
     with patch('app.clients.gcloud_client.GCloudClient') as mock:
         instance = Mock()
+        instance.ephemeral = False
         instance.create_runner_instance.return_value = "runner-fake123"
         instance.delete_runner_instance.return_value = None
         instance.find_runner_by_job_id.return_value = None
         instance.list_runner_instances.return_value = iter([])
+        instance.count_supply_by_label.return_value = {}
+        instance.count_live_runners_by_label.return_value = {}
         mock.return_value = instance
         yield instance
 

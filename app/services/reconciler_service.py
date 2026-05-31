@@ -49,6 +49,15 @@ logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 30  # seconds, matches github_client
 DEFAULT_MIN_AGE_SECONDS = 120
+DEFAULT_INFLIGHT_WINDOW_SECONDS = 180
+DEFAULT_MAX_CREATES_PER_PASS = 100
+
+
+def _int_env(name, default):
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def _parse_iso8601_to_epoch(s: str) -> Optional[float]:
@@ -73,14 +82,20 @@ class ReconcilerService:
         self.github_client = GitHubClient()
         self.gcloud_client = GCloudClient()
         self.tasks_client = CloudTasksClient()
-        try:
-            self.min_age_seconds = int(
-                os.environ.get(
-                    'GITHUB_RECONCILER_MIN_JOB_AGE_SECONDS', DEFAULT_MIN_AGE_SECONDS
-                )
-            )
-        except ValueError:
-            self.min_age_seconds = DEFAULT_MIN_AGE_SECONDS
+        self.min_age_seconds = _int_env(
+            'GITHUB_RECONCILER_MIN_JOB_AGE_SECONDS', DEFAULT_MIN_AGE_SECONDS
+        )
+        # VMs created within this window count as in-flight supply, so the
+        # reconciler does not re-create the runners it spun up last pass.
+        self.inflight_window_seconds = _int_env(
+            'GITHUB_RECONCILER_INFLIGHT_WINDOW_SECONDS', DEFAULT_INFLIGHT_WINDOW_SECONDS
+        )
+        # Hard cap on how many VMs the reconciler will create per label per
+        # pass. A backstop against runaway creation if the supply count is
+        # ever wrong; the webhook path is the primary creator anyway.
+        self.max_creates_per_pass = _int_env(
+            'GITHUB_RECONCILER_MAX_CREATES_PER_PASS', DEFAULT_MAX_CREATES_PER_PASS
+        )
 
     def reconcile(self, target_url: str) -> dict:
         """Run one capacity-aware reconciliation pass.
@@ -152,30 +167,36 @@ class ReconcilerService:
                         label = self._gcp_label(job)
                         demand_by_label[label].append((job, repo, owner_type))
 
-        # ── Phase 2: live supply per label (one GCE list call) ──
+        # ── Phase 2: supply per label (live + in-flight VMs, one GCE call) ──
         try:
-            supply_by_label = self.gcloud_client.count_live_runners_by_label()
+            supply_by_label = self.gcloud_client.count_supply_by_label(
+                inflight_window_seconds=self.inflight_window_seconds
+            )
         except Exception as e:
-            logger.error("Reconciler could not count live runners: %s", e)
+            logger.error("Reconciler could not count supply: %s", e)
             result['errors'] += 1
             supply_by_label = {}
 
-        # ── Phase 3: enqueue only the deficit, oldest-first ──
+        # ── Phase 3: enqueue only the deficit, oldest-first, capped ──
         for label, items in demand_by_label.items():
             demand = len(items)
             supply = supply_by_label.get(label, 0)
             deficit = max(0, demand - supply)
+            # Cap how many we create this pass; the rest recover next pass once
+            # this batch is counted as in-flight supply.
+            to_create = min(deficit, self.max_creates_per_pass)
             result['by_label'][label] = {
-                'demand': demand, 'supply': supply, 'deficit': deficit,
+                'demand': demand, 'supply': supply,
+                'deficit': deficit, 'creating': to_create,
             }
-            if deficit == 0:
+            if to_create == 0:
                 result['jobs_skipped_have_capacity'] += demand
                 continue
 
             # Oldest jobs first — bounds worst-case wait for any single job.
             items.sort(key=lambda t: t[0].get('created_at') or '')
-            result['jobs_skipped_have_capacity'] += (demand - deficit)
-            for job, repo, owner_type in items[:deficit]:
+            result['jobs_skipped_have_capacity'] += (demand - to_create)
+            for job, repo, owner_type in items[:to_create]:
                 try:
                     self._enqueue_synthetic_workflow_job(
                         target_url=target_url,

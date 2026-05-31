@@ -277,3 +277,44 @@ class TestGitHubClientDeliveryIdLogging:
         assert any(
             "gh-org-delivery-001" in r.message for r in caplog.records
         ), "delivery_id not found in log for org registration token"
+
+
+class TestRunnerManagement:
+    @patch('app.clients.github_client.requests.get')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
+    def test_list_runners_paginates(self, mock_tok, mock_get, mock_env_vars):
+        from unittest.mock import MagicMock
+        page1 = MagicMock()
+        page1.json.return_value = {'runners': [{'id': i, 'name': f'gcp-runner-{i}'} for i in range(100)]}
+        page2 = MagicMock()
+        page2.json.return_value = {'runners': [{'id': 100, 'name': 'gcp-runner-100'}]}
+        mock_get.side_effect = [page1, page2]
+
+        client = GitHubClient()
+        runners = client.list_runners(org_name='DeveloEngineering')
+        assert len(runners) == 101
+        assert mock_get.call_count == 2
+
+    @patch('app.clients.github_client.requests.delete')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
+    def test_delete_runner_success(self, mock_tok, mock_del, mock_env_vars):
+        from unittest.mock import MagicMock
+        resp = MagicMock(); resp.status_code = 204
+        mock_del.return_value = resp
+        client = GitHubClient()
+        assert client.delete_runner(5, org_name='DeveloEngineering') is True
+
+    @patch('app.clients.github_client.requests.delete')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
+    def test_delete_runner_busy_returns_false(self, mock_tok, mock_del, mock_env_vars):
+        from unittest.mock import MagicMock
+        resp = MagicMock(); resp.status_code = 422; resp.text = 'busy'
+        mock_del.return_value = resp
+        client = GitHubClient()
+        assert client.delete_runner(5, org_name='DeveloEngineering') is False
+
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
+    def test_delete_runner_requires_scope(self, mock_tok, mock_env_vars):
+        client = GitHubClient()
+        with pytest.raises(ValueError):
+            client.delete_runner(5)

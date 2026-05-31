@@ -168,6 +168,102 @@ class GitHubClient:
         response.raise_for_status()
         return response.json()['token']
 
+    def _auth_headers(self):
+        token = self.get_installation_access_token()
+        return {
+            'Authorization': f'Bearer {token}',
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28',
+        }
+
+    def list_installation_repos(self):
+        """List repos the GitHub App is installed on (single page, max 100)."""
+        url = 'https://api.github.com/installation/repositories?per_page=100'
+        r = requests.get(url, headers=self._auth_headers(), timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get('repositories', [])
+
+    def list_active_runs(self, owner, name):
+        """Yield queued + in_progress workflow runs for a repo."""
+        headers = self._auth_headers()
+        for status in ('queued', 'in_progress'):
+            url = (
+                f'https://api.github.com/repos/{owner}/{name}/actions/runs'
+                f'?status={status}&per_page=30'
+            )
+            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            r.raise_for_status()
+            for run in r.json().get('workflow_runs', []):
+                yield run
+
+    def list_run_jobs(self, owner, name, run_id):
+        """Return all jobs for a workflow run (single page, max 100)."""
+        url = (
+            f'https://api.github.com/repos/{owner}/{name}/actions/runs/'
+            f'{run_id}/jobs?per_page=100'
+        )
+        r = requests.get(url, headers=self._auth_headers(), timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        return r.json().get('jobs', [])
+
+    def list_runners(self, org_name=None, repo_name=None):
+        """List self-hosted runners for an org or repo.
+
+        Returns a list of runner dicts: {id, name, status, busy, labels:[...]}.
+        Paginates fully (org runner fleets can exceed one page).
+        """
+        if org_name:
+            base = f"https://api.github.com/orgs/{org_name}/actions/runners"
+        elif repo_name:
+            base = f"https://api.github.com/repos/{repo_name}/actions/runners"
+        else:
+            raise ValueError("Either org_name or repo_name must be provided")
+
+        headers = self._auth_headers()
+        runners = []
+        page = 1
+        while True:
+            resp = requests.get(
+                f"{base}?per_page=100&page={page}",
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            resp.raise_for_status()
+            batch = resp.json().get('runners', [])
+            runners.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        return runners
+
+    def delete_runner(self, runner_id, org_name=None, repo_name=None):
+        """Deregister a self-hosted runner from GitHub.
+
+        GitHub rejects removal of a runner that is currently running a job
+        (HTTP 422) unless ``force`` is used — we never force, so this is safe
+        against killing in-flight jobs. Returns True on success, False if the
+        runner was busy (or otherwise not removable).
+        """
+        if org_name:
+            url = f"https://api.github.com/orgs/{org_name}/actions/runners/{runner_id}"
+        elif repo_name:
+            url = f"https://api.github.com/repos/{repo_name}/actions/runners/{runner_id}"
+        else:
+            raise ValueError("Either org_name or repo_name must be provided")
+
+        resp = requests.delete(url, headers=self._auth_headers(), timeout=REQUEST_TIMEOUT)
+        if resp.status_code in (204, 200):
+            return True
+        if resp.status_code == 422:
+            # Runner became busy between our check and this call — leave it be.
+            logger.info("Runner %s is busy; skipping deregister", runner_id)
+            return False
+        logger.warning(
+            "Unexpected status deleting runner %s: %s %s",
+            runner_id, resp.status_code, resp.text[:200],
+        )
+        return False
+
 
 def _parse_iso8601_to_epoch(s):
     """Parse a GitHub-style ISO-8601 timestamp (e.g. '2026-05-29T18:15:00Z') to epoch seconds."""

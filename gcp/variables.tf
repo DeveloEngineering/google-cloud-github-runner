@@ -185,6 +185,35 @@ variable "github_runners_reconciler_min_job_age_seconds" {
   }
 }
 
+# VMs created within this window count as in-flight supply when the reconciler
+# computes per-label deficits, so it does not re-create the runners it spun up
+# on the previous pass (the root cause of burst over-provisioning).
+variable "github_runners_reconciler_inflight_window_seconds" {
+  description = "Reconciler treats VMs younger than this as in-flight supply"
+  type        = number
+  default     = 180
+  nullable    = false
+}
+
+# Hard cap on VM-creates per label per reconciler pass. Backstop against
+# runaway creation; the webhook path is the primary creator.
+variable "github_runners_reconciler_max_creates_per_pass" {
+  description = "Max VMs the reconciler will create per label per pass"
+  type        = number
+  default     = 100
+  nullable    = false
+}
+
+# When true, runners register with --ephemeral and are deleted after one job.
+# When false (default), runners stay registered and serve multiple jobs; the
+# sweeper reaps idle ones. Reuse avoids per-job cold-boot and cuts VM churn.
+variable "github_runners_ephemeral" {
+  description = "Use single-use ephemeral runners (true) or reusable runners (false)"
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
 # Cron schedule for the orphan-runner sweeper job.
 variable "github_runners_orphan_sweep_schedule" {
   description = "Cloud Scheduler cron expression for the orphan-runner sweeper"

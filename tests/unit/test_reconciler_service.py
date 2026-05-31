@@ -78,7 +78,7 @@ class TestCapacityAwareReconcile:
         svc._list_installation_repos = MagicMock(return_value=[_repo()])
         svc._list_active_runs = MagicMock(return_value=[{'id': 999}])
         svc._list_run_jobs = MagicMock(return_value=jobs)
-        svc.gcloud_client.count_live_runners_by_label = MagicMock(return_value=live_by_label)
+        svc.gcloud_client.count_supply_by_label = MagicMock(return_value=live_by_label)
         svc.tasks_client.enqueue_workflow_job = MagicMock()
 
     def test_no_enqueue_when_supply_meets_demand(self, svc):
@@ -93,7 +93,7 @@ class TestCapacityAwareReconcile:
         assert result['jobs_enqueued'] == 0
         assert result['jobs_skipped_have_capacity'] == 3
         assert result['by_label']['gcp-ubuntu-24-04-8core-arm'] == {
-            'demand': 3, 'supply': 3, 'deficit': 0
+            'demand': 3, 'supply': 3, 'deficit': 0, 'creating': 0
         }
         svc.tasks_client.enqueue_workflow_job.assert_not_called()
 
@@ -156,6 +156,23 @@ class TestCapacityAwareReconcile:
         assert result['jobs_skipped_young'] == 1
         assert result['by_label']['gcp-ubuntu-24-04-8core-arm']['demand'] == 1
         assert result['jobs_enqueued'] == 1
+
+    def test_per_pass_cap_limits_creates(self, svc):
+        # 300 queued, 0 supply, but the per-pass cap (set to 10 here) bounds it
+        svc.max_creates_per_pass = 10
+        jobs = []
+        for i in range(300):
+            j = _job(i, started_at=_old_ts(600 + i))
+            j['labels'] = ['gcp-ubuntu-24-04-8core-arm']
+            jobs.append(j)
+        self._wire(svc, jobs, {})
+
+        result = svc.reconcile(target_url='https://x/internal/process-workflow-job')
+
+        assert result['jobs_enqueued'] == 10  # capped, not 300
+        bl = result['by_label']['gcp-ubuntu-24-04-8core-arm']
+        assert bl['deficit'] == 300 and bl['creating'] == 10
+        assert svc.tasks_client.enqueue_workflow_job.call_count == 10
 
 
 class TestSyntheticPayload:
