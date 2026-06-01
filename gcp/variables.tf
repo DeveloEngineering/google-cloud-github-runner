@@ -214,6 +214,34 @@ variable "github_runners_ephemeral" {
   nullable    = false
 }
 
+# Cloud Tasks dispatch rate limits (webhook -> /internal -> instances.insert).
+# A moderate cap smooths GCE insert load. Token caching means a high rate is
+# safe from GitHub's secondary rate limit.
+variable "github_runners_tasks_max_dispatches_per_second" {
+  description = "Cloud Tasks max dispatches/sec for the workflow-job queue"
+  type        = number
+  default     = 50
+  nullable    = false
+}
+
+variable "github_runners_tasks_max_concurrent_dispatches" {
+  description = "Cloud Tasks max concurrent dispatches for the workflow-job queue"
+  type        = number
+  default     = 100
+  nullable    = false
+}
+
+# Run runner VMs as Spot instances (~60-70% cheaper than on-demand). CI jobs
+# are interruptible: a preempted job re-queues and re-runs, and the VM is
+# DELETED on preemption (termination_action). Set false to use on-demand
+# STANDARD VMs (e.g. if preemption-driven re-runs ever hurt a critical path).
+variable "github_runners_spot" {
+  description = "Provision runner VMs as Spot instances (cheaper, preemptible)"
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
 # Cron schedule for the orphan-runner sweeper job.
 variable "github_runners_orphan_sweep_schedule" {
   description = "Cloud Scheduler cron expression for the orphan-runner sweeper"
@@ -524,14 +552,18 @@ variable "github_runners_types" {
       arch                        = "arm64"
     },
     {
-      name                        = "gcp-ubuntu-24-04-2core-arm"
-      instance_type               = "c4a-standard-2"
-      vcpu                        = 2
-      memory                      = 8
-      disk_type                   = "hyperdisk-balanced"
-      disk_size                   = 75
-      disk_provisioned_iops       = 3450
-      disk_provisioned_throughput = 252
+      name          = "gcp-ubuntu-24-04-2core-arm"
+      instance_type = "c4a-standard-2"
+      vcpu          = 2
+      memory        = 8
+      disk_type     = "hyperdisk-balanced"
+      # Right-sized for ephemeral/reusable CI runners: ample capacity for the
+      # ~30 GB baked image + working space, and provisioned IOPS/throughput
+      # just above the free hyperdisk-balanced baseline (3000 IOPS / 140 MB/s)
+      # — eliminating the per-VM-hour surcharge that dominated disk cost.
+      disk_size                   = 50
+      disk_provisioned_iops       = 3060
+      disk_provisioned_throughput = 155
       image                       = "ubuntu-2404-lts-arm64"
       arch                        = "arm64"
     },
@@ -541,9 +573,9 @@ variable "github_runners_types" {
       vcpu                        = 4
       memory                      = 16
       disk_type                   = "hyperdisk-balanced"
-      disk_size                   = 150
-      disk_provisioned_iops       = 3900
-      disk_provisioned_throughput = 365
+      disk_size                   = 80
+      disk_provisioned_iops       = 3060
+      disk_provisioned_throughput = 155
       image                       = "ubuntu-2404-lts-arm64"
       arch                        = "arm64"
     },
@@ -553,9 +585,9 @@ variable "github_runners_types" {
       vcpu                        = 8
       memory                      = 32
       disk_type                   = "hyperdisk-balanced"
-      disk_size                   = 300
-      disk_provisioned_iops       = 4800
-      disk_provisioned_throughput = 590
+      disk_size                   = 120
+      disk_provisioned_iops       = 3060
+      disk_provisioned_throughput = 155
       image                       = "ubuntu-2404-lts-arm64"
       arch                        = "arm64"
     },

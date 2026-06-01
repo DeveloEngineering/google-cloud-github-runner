@@ -28,6 +28,15 @@ _token_cache = {
     'expires_at': 0.0,  # epoch seconds
 }
 
+# Runner registration tokens are valid for ONE HOUR and can register MANY
+# runners within that window. Fetching a fresh token per VM hammered GitHub's
+# secondary rate limit on this endpoint under burst load (hundreds of token
+# POSTs/min) and got us 403'd. Cache per scope (org/repo) and reuse until
+# shortly before expiry — cutting token-endpoint calls by ~100x.
+REG_TOKEN_REFRESH_BUFFER_SECONDS = 600  # refresh 10 min before the 1h expiry
+_reg_token_cache_lock = threading.Lock()
+_reg_token_cache = {}  # scope_key -> {'token': str, 'expires_at': float}
+
 
 class GitHubClient:
     """Client for authenticated interactions with the GitHub API as a GitHub App."""
@@ -137,36 +146,59 @@ class GitHubClient:
             return token
 
     def get_registration_token(self, org_name=None, repo_name=None, delivery_id=None):
-        """Gets a runner registration token."""
-        # https://docs.github.com/en/rest/actions/self-hosted-runners
-        token = self.get_installation_access_token()
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'Accept': 'application/vnd.github+json',
-            'X-GitHub-Api-Version': '2022-11-28'
-        }
+        """Get a runner registration token, reusing a cached one per scope.
+
+        Registration tokens live ~1 hour and can register many runners, so we
+        cache per (org/repo) scope and reuse until shortly before expiry. This
+        cut the per-VM token POST down to ~1/hour/scope and is what keeps us
+        under GitHub's secondary rate limit on this endpoint during bursts.
+        """
         if org_name:
-            # GitHub Docs: https://t.ly/dAyGK
-            url = f"https://api.github.com/orgs/{org_name}/actions/runners/registration-token"
-            logger.info(
-                "Create registration token for organization: %s, delivery_id: %s",
-                org_name,
-                delivery_id,
-            )
+            scope_key = f"org:{org_name}"
         elif repo_name:
-            # GitHub Docs: https://t.ly/n0w2a
-            url = f"https://api.github.com/repos/{repo_name}/actions/runners/registration-token"
-            logger.info(
-                "Create registration token for repository: %s, delivery_id: %s",
-                repo_name,
-                delivery_id,
-            )
+            scope_key = f"repo:{repo_name}"
         else:
             raise ValueError("Either org_name or repo_name must be provided")
 
+        with _reg_token_cache_lock:
+            now = time.time()
+            entry = _reg_token_cache.get(scope_key)
+            if entry and now < (entry['expires_at'] - REG_TOKEN_REFRESH_BUFFER_SECONDS):
+                return entry['token']
+
+            token, expires_at_epoch = self._request_new_registration_token(
+                org_name=org_name, repo_name=repo_name, delivery_id=delivery_id
+            )
+            _reg_token_cache[scope_key] = {
+                'token': token, 'expires_at': expires_at_epoch,
+            }
+            logger.info(
+                "Refreshed registration token for %s (expires in %ds), delivery_id: %s",
+                scope_key, int(expires_at_epoch - now), delivery_id,
+            )
+            return token
+
+    def _request_new_registration_token(self, org_name=None, repo_name=None, delivery_id=None):
+        """Mint a fresh runner registration token from the GitHub API."""
+        # https://docs.github.com/en/rest/actions/self-hosted-runners
+        headers = self._auth_headers()
+        if org_name:
+            url = f"https://api.github.com/orgs/{org_name}/actions/runners/registration-token"
+        else:
+            url = f"https://api.github.com/repos/{repo_name}/actions/runners/registration-token"
+
         response = requests.post(url, headers=headers, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
-        return response.json()['token']
+        payload = response.json()
+        token = payload['token']
+        expires_at = payload.get('expires_at')
+        try:
+            expires_at_epoch = _parse_iso8601_to_epoch(expires_at) if expires_at else None
+        except Exception:
+            expires_at_epoch = None
+        if not expires_at_epoch:
+            expires_at_epoch = time.time() + 55 * 60
+        return token, expires_at_epoch
 
     def _auth_headers(self):
         token = self.get_installation_access_token()
@@ -278,7 +310,9 @@ def _parse_iso8601_to_epoch(s):
 
 
 def _reset_token_cache_for_tests():
-    """Test helper: clear the module-level token cache between tests."""
+    """Test helper: clear the module-level token caches between tests."""
     with _token_cache_lock:
         _token_cache['token'] = None
         _token_cache['expires_at'] = 0.0
+    with _reg_token_cache_lock:
+        _reg_token_cache.clear()

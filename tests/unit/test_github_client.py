@@ -318,3 +318,32 @@ class TestRunnerManagement:
         client = GitHubClient()
         with pytest.raises(ValueError):
             client.delete_runner(5)
+
+
+class TestRegistrationTokenCaching:
+    @patch('app.clients.github_client.requests.post')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='inst')
+    def test_registration_token_cached_per_scope(self, mock_tok, mock_post, mock_env_vars):
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.json.return_value = {'token': 'REG1', 'expires_at': '2099-01-01T00:00:00Z'}
+        mock_post.return_value = resp
+
+        c = GitHubClient()
+        t1 = c.get_registration_token(org_name='DeveloEngineering')
+        t2 = c.get_registration_token(org_name='DeveloEngineering')
+        assert t1 == t2 == 'REG1'
+        assert mock_post.call_count == 1  # one POST across both calls
+
+    @patch('app.clients.github_client.requests.post')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='inst')
+    def test_registration_token_separate_scopes_not_shared(self, mock_tok, mock_post, mock_env_vars):
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.json.return_value = {'token': 'REG', 'expires_at': '2099-01-01T00:00:00Z'}
+        mock_post.return_value = resp
+
+        c = GitHubClient()
+        c.get_registration_token(org_name='OrgA')
+        c.get_registration_token(repo_name='owner/repo')
+        assert mock_post.call_count == 2  # distinct scopes

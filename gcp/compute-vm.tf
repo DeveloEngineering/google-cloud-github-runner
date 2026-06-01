@@ -34,6 +34,10 @@ module "github-runners-vm-templates" {
   }
 
   options = {
+    # Spot VMs are ~60-70% cheaper. termination_action=DELETE covers BOTH Spot
+    # preemption and max_run_duration expiry — the disposable runner VM is
+    # deleted in either case.
+    spot               = var.github_runners_spot
     termination_action = "DELETE"
     # https://docs.github.com/en/actions/reference/limits#existing-system-limits
     max_run_duration = {
