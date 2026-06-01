@@ -163,7 +163,14 @@ class GCloudClient:
             "--unattended "
             "--no-default-labels "
             "--disableupdate && "
-            "sudo -u runner ./run.sh"
+            "sudo -u runner ./run.sh; "
+            # Self-clean: once the runner process exits — ephemeral job done, or
+            # config failed, or the runner was deregistered in reusable mode —
+            # power the VM off. It lands in TERMINATED and the sweeper reclaims
+            # it on its next pass, so a dropped completion webhook can no longer
+            # leave an idle zombie. The ';' ensures this runs regardless of how
+            # run.sh exits. Removes the deletion dependency on the webhook.
+            "sudo shutdown -h now"
         )
         metadata = compute_v1.Metadata()
         metadata.items = [

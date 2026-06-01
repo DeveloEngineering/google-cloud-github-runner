@@ -150,7 +150,11 @@ variable "github_runners_max_run_duration" {
 variable "github_runners_orphan_max_age_seconds" {
   description = "Age threshold above which the sweeper deletes runner VMs (must exceed your longest CI job)"
   type        = number
-  default     = 7200 # 2 hours
+  # 60 min: ephemeral CI jobs finish well under 25 min, so this is ~2.5x
+  # headroom over the longest plausible single job while capping the cost of
+  # any VM whose completion webhook was dropped. Self-shutdown (below) plus
+  # immediate TERMINATED-reclaim handle the common case; this is the backstop.
+  default = 3600 # 1 hour
 
   validation {
     condition     = var.github_runners_orphan_max_age_seconds >= 600

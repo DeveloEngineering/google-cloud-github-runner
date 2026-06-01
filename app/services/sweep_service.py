@@ -72,15 +72,37 @@ class SweepService:
     # Age-based orphan sweep (always runs)
     # ------------------------------------------------------------------
 
+    # GCE states for a VM that has powered itself off (self-shutdown after its
+    # job) — reclaim these immediately, no age threshold needed.
+    _STOPPED_STATES = frozenset({'TERMINATED', 'STOPPED', 'STOPPING'})
+
     def _sweep_orphans_by_age(self, skip_names=None):
         skip_names = skip_names or set()
         inspected = 0
         deleted_names = []
+        stopped_reclaimed = 0
         skipped = 0
         errors = 0
 
         for instance in self.gcloud_client.list_runner_instances():
             inspected += 1
+
+            # Self-shut-down runners (job done, VM powered off) are reclaimed
+            # immediately regardless of age — they are definitively finished.
+            if instance.status in self._STOPPED_STATES:
+                try:
+                    self.gcloud_client.delete_runner_instance(instance.name)
+                    deleted_names.append(instance.name)
+                    stopped_reclaimed += 1
+                    logger.info(
+                        "Reclaimed self-stopped runner %s (status=%s)",
+                        instance.name, instance.status,
+                    )
+                except Exception as e:
+                    errors += 1
+                    logger.error("Failed to delete stopped runner %s: %s", instance.name, e)
+                continue
+
             age = GCloudClient.instance_age_seconds(instance)
             if age is None or age < self.max_age_seconds:
                 skipped += 1
@@ -104,6 +126,7 @@ class SweepService:
         return {
             'inspected': inspected,
             'deleted': len(deleted_names),
+            'stopped_reclaimed': stopped_reclaimed,
             'skipped': skipped,
             'errors': errors,
             'deleted_names': deleted_names,

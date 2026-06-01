@@ -3,9 +3,10 @@ from unittest.mock import Mock, patch
 from app.services.sweep_service import SweepService
 
 
-def _instance(name, age_seconds):
+def _instance(name, age_seconds, status="RUNNING"):
     inst = Mock()
     inst.name = name
+    inst.status = status
     inst._age_seconds = age_seconds
     return inst
 
@@ -40,6 +41,26 @@ class TestAgeBasedOrphanSweep:
         assert result['skipped'] == 1
         assert 'idle_reap' not in result  # ephemeral mode: no idle reaping
         gc.delete_runner_instance.assert_called_once_with('gcp-runner-old')
+
+    def test_stopped_vms_reclaimed_immediately_regardless_of_age(self):
+        """Self-shut-down runners (TERMINATED) are deleted even if young."""
+        gc = Mock()
+        gc.ephemeral = True
+        gc.list_runner_instances.return_value = iter([
+            _instance('gcp-runner-young-running', 60, status='RUNNING'),      # kept (young, running)
+            _instance('gcp-runner-stopped', 30, status='TERMINATED'),        # reclaimed (self-shutdown)
+            _instance('gcp-runner-stopping', 5, status='STOPPING'),          # reclaimed
+        ])
+        svc = _bare_service(gc)
+        with patch(
+            'app.services.sweep_service.GCloudClient.instance_age_seconds',
+            staticmethod(lambda i: i._age_seconds),
+        ):
+            result = svc.sweep()
+
+        assert result['stopped_reclaimed'] == 2
+        assert set(result['deleted_names']) == {'gcp-runner-stopped', 'gcp-runner-stopping'}
+        assert 'gcp-runner-young-running' not in result['deleted_names']
 
     def test_continues_when_one_delete_fails(self):
         gc = Mock()
