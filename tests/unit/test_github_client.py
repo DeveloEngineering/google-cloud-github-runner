@@ -277,3 +277,73 @@ class TestGitHubClientDeliveryIdLogging:
         assert any(
             "gh-org-delivery-001" in r.message for r in caplog.records
         ), "delivery_id not found in log for org registration token"
+
+
+class TestRunnerManagement:
+    @patch('app.clients.github_client.requests.get')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
+    def test_list_runners_paginates(self, mock_tok, mock_get, mock_env_vars):
+        from unittest.mock import MagicMock
+        page1 = MagicMock()
+        page1.json.return_value = {'runners': [{'id': i, 'name': f'gcp-runner-{i}'} for i in range(100)]}
+        page2 = MagicMock()
+        page2.json.return_value = {'runners': [{'id': 100, 'name': 'gcp-runner-100'}]}
+        mock_get.side_effect = [page1, page2]
+
+        client = GitHubClient()
+        runners = client.list_runners(org_name='DeveloEngineering')
+        assert len(runners) == 101
+        assert mock_get.call_count == 2
+
+    @patch('app.clients.github_client.requests.delete')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
+    def test_delete_runner_success(self, mock_tok, mock_del, mock_env_vars):
+        from unittest.mock import MagicMock
+        resp = MagicMock(); resp.status_code = 204
+        mock_del.return_value = resp
+        client = GitHubClient()
+        assert client.delete_runner(5, org_name='DeveloEngineering') is True
+
+    @patch('app.clients.github_client.requests.delete')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
+    def test_delete_runner_busy_returns_false(self, mock_tok, mock_del, mock_env_vars):
+        from unittest.mock import MagicMock
+        resp = MagicMock(); resp.status_code = 422; resp.text = 'busy'
+        mock_del.return_value = resp
+        client = GitHubClient()
+        assert client.delete_runner(5, org_name='DeveloEngineering') is False
+
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
+    def test_delete_runner_requires_scope(self, mock_tok, mock_env_vars):
+        client = GitHubClient()
+        with pytest.raises(ValueError):
+            client.delete_runner(5)
+
+
+class TestRegistrationTokenCaching:
+    @patch('app.clients.github_client.requests.post')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='inst')
+    def test_registration_token_cached_per_scope(self, mock_tok, mock_post, mock_env_vars):
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.json.return_value = {'token': 'REG1', 'expires_at': '2099-01-01T00:00:00Z'}
+        mock_post.return_value = resp
+
+        c = GitHubClient()
+        t1 = c.get_registration_token(org_name='DeveloEngineering')
+        t2 = c.get_registration_token(org_name='DeveloEngineering')
+        assert t1 == t2 == 'REG1'
+        assert mock_post.call_count == 1  # one POST across both calls
+
+    @patch('app.clients.github_client.requests.post')
+    @patch.object(GitHubClient, 'get_installation_access_token', return_value='inst')
+    def test_registration_token_separate_scopes_not_shared(self, mock_tok, mock_post, mock_env_vars):
+        from unittest.mock import MagicMock
+        resp = MagicMock()
+        resp.json.return_value = {'token': 'REG', 'expires_at': '2099-01-01T00:00:00Z'}
+        mock_post.return_value = resp
+
+        c = GitHubClient()
+        c.get_registration_token(org_name='OrgA')
+        c.get_registration_token(repo_name='owner/repo')
+        assert mock_post.call_count == 2  # distinct scopes

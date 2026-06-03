@@ -182,6 +182,45 @@ class TestGCloudClient:
             client.delete_runner_instance('runner-12345')
 
     @patch('app.clients.gcloud_client.compute_v1')
+    def test_ephemeral_flag_default_false(self, mock_compute, mock_env_vars):
+        """By default runners are reusable (no --ephemeral in startup script)."""
+        client = GCloudClient()
+        assert client.ephemeral is False
+
+    @patch('app.clients.gcloud_client.compute_v1')
+    def test_ephemeral_flag_true_when_env_set(self, mock_compute, monkeypatch, mock_env_vars):
+        monkeypatch.setenv('RUNNER_EPHEMERAL', 'true')
+        client = GCloudClient()
+        assert client.ephemeral is True
+
+    @patch('app.clients.gcloud_client.compute_v1')
+    def test_supply_counts_inflight_recent_vms(self, mock_compute, mock_env_vars):
+        """Recently-created VMs count as supply even if not yet live."""
+        def _inst(name, status, label, age):
+            m = MagicMock()
+            m.name = name
+            m.status = status
+            m.labels = {'gha-runner': label}
+            m.creation_timestamp = '2026-01-01T00:00:00Z'
+            m._age = age
+            return m
+
+        L = 'gcp-ubuntu-24-04-8core-arm'
+        instances = [
+            _inst('gcp-runner-1', 'RUNNING', L, 500),       # live → counts
+            _inst('gcp-runner-2', 'STOPPING', L, 30),       # not live but young → in-flight counts
+            _inst('gcp-runner-3', 'STOPPING', L, 9999),     # not live + old → excluded
+        ]
+        mock_client = MagicMock()
+        mock_client.list.return_value = iter(instances)
+        mock_compute.InstancesClient.return_value = mock_client
+
+        client = GCloudClient()
+        with patch.object(GCloudClient, 'instance_age_seconds', staticmethod(lambda i: i._age)):
+            counts = client.count_supply_by_label(inflight_window_seconds=180)
+        assert counts == {L: 2}  # live + young-inflight; old-stopping excluded
+
+    @patch('app.clients.gcloud_client.compute_v1')
     def test_count_live_runners_by_label(self, mock_compute, mock_env_vars):
         """Counts non-terminating runner VMs grouped by gha-runner label."""
         def _inst(name, status, runner_label):

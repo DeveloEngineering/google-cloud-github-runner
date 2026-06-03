@@ -14,11 +14,12 @@ resource "google_cloud_tasks_queue" "workflow_job_queue" {
   location = var.region
 
   rate_limits {
-    # We have plenty of Cloud Run capacity (max 30 instances × 8 concurrency
-    # = 240 slots) but cap dispatch rate so we don't overwhelm the GCE
-    # instances.insert API quota.
-    max_dispatches_per_second = 200
-    max_concurrent_dispatches = 200
+    # Dispatch rate caps how fast tasks -> /internal -> instances.insert fire.
+    # Token caching means a high rate no longer risks GitHub's secondary rate
+    # limit, but a moderate cap still smooths the GCE insert load and pairs
+    # with the reconciler's per-pass create cap. Configurable via variables.
+    max_dispatches_per_second = var.github_runners_tasks_max_dispatches_per_second
+    max_concurrent_dispatches = var.github_runners_tasks_max_concurrent_dispatches
   }
 
   retry_config {

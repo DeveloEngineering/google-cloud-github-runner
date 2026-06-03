@@ -117,11 +117,12 @@ class TestWebhookService:
     @patch('app.services.webhook_service.GCloudClient')
     @patch('app.services.webhook_service.GitHubClient')
     def test_handle_completed_job(self, mock_gh_client_class, mock_gc_client_class):
-        """Test handling completed job."""
+        """Ephemeral mode: completed job deletes the runner VM."""
         mock_gh_client = Mock()
         mock_gh_client_class.return_value = mock_gh_client
 
         mock_gc_client = Mock()
+        mock_gc_client.ephemeral = True  # ephemeral mode → delete on complete
         mock_gc_client.find_runner_by_job_id.return_value = None
         mock_gc_client_class.return_value = mock_gc_client
 
@@ -142,6 +143,22 @@ class TestWebhookService:
         mock_gc_client.delete_runner_instance.assert_called_once_with(
             'gcp-runner-12345', delivery_id="delivery-completed-001"
         )
+
+    @patch('app.services.webhook_service.GCloudClient')
+    @patch('app.services.webhook_service.GitHubClient')
+    def test_completed_job_reusable_mode_keeps_vm(self, mock_gh_client_class, mock_gc_client_class):
+        """Reusable mode: completed job does NOT delete the VM (sweeper reaps)."""
+        mock_gh_client_class.return_value = Mock()
+        mock_gc_client = Mock()
+        mock_gc_client.ephemeral = False  # reusable mode
+        mock_gc_client_class.return_value = mock_gc_client
+
+        service = WebhookService()
+        payload = {'action': 'completed', 'workflow_job': {'runner_name': 'gcp-runner-abc'}}
+        result = service.handle_workflow_job(payload, delivery_id="d-1")
+
+        assert result == {"action": "deleted", "runner_name": None}
+        mock_gc_client.delete_runner_instance.assert_not_called()
 
     @patch('app.services.webhook_service.GCloudClient')
     @patch('app.services.webhook_service.GitHubClient')

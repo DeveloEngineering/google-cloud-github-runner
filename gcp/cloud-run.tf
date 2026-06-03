@@ -58,6 +58,12 @@ module "cloud_run_github_runners_manager" {
         # Reconciler config — minimum age before reconciler will act on a
         # stuck job. Protects against racing in-flight webhook deliveries.
         GITHUB_RECONCILER_MIN_JOB_AGE_SECONDS = tostring(var.github_runners_reconciler_min_job_age_seconds)
+        # Pipeline-awareness + per-pass cap to prevent burst over-provisioning.
+        GITHUB_RECONCILER_INFLIGHT_WINDOW_SECONDS = tostring(var.github_runners_reconciler_inflight_window_seconds)
+        GITHUB_RECONCILER_MAX_CREATES_PER_PASS    = tostring(var.github_runners_reconciler_max_creates_per_pass)
+        # Runner reuse: false = reusable runners (serve many jobs, sweeper
+        # reaps idle), true = single-use ephemeral runners.
+        RUNNER_EPHEMERAL = var.github_runners_ephemeral ? "true" : "false"
       }
       env_from_key = {
         GITHUB_APP_ID = {

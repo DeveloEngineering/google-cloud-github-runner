@@ -185,12 +185,26 @@ class WebhookService:
     def _handle_completed_job(self, workflow_job, delivery_id=None):
         """Handle completed workflow job.
 
+        In ephemeral mode the runner is single-use, so we delete its VM here.
+        In reusable mode (default) the VM stays registered to serve the next
+        job — deletion is left entirely to the sweeper's idle-reaping. This is
+        what makes a single VM serve many jobs and slashes create churn.
+
         Returns:
-            str or None: The name of the deleted runner instance.
+            str or None: The name of the deleted runner instance (ephemeral
+            mode), or None when the runner is intentionally kept.
         """
         runner_name = workflow_job.get('runner_name')
+
+        if not self.gcloud_client.ephemeral:
+            logger.info(
+                "Job completed on reusable runner %s; keeping it warm. delivery_id: %s",
+                runner_name, delivery_id,
+            )
+            return None
+
         logger.info(
-            "Job completed. Cleaning up runner: %s, delivery_id: %s",
+            "Job completed. Cleaning up ephemeral runner: %s, delivery_id: %s",
             runner_name,
             delivery_id,
         )

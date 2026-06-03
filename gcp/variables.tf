@@ -150,7 +150,11 @@ variable "github_runners_max_run_duration" {
 variable "github_runners_orphan_max_age_seconds" {
   description = "Age threshold above which the sweeper deletes runner VMs (must exceed your longest CI job)"
   type        = number
-  default     = 7200 # 2 hours
+  # 60 min: ephemeral CI jobs finish well under 25 min, so this is ~2.5x
+  # headroom over the longest plausible single job while capping the cost of
+  # any VM whose completion webhook was dropped. Self-shutdown (below) plus
+  # immediate TERMINATED-reclaim handle the common case; this is the backstop.
+  default = 3600 # 1 hour
 
   validation {
     condition     = var.github_runners_orphan_max_age_seconds >= 600
@@ -183,6 +187,63 @@ variable "github_runners_reconciler_min_job_age_seconds" {
     condition     = var.github_runners_reconciler_min_job_age_seconds >= 30
     error_message = "Reconciler min job age must be at least 30 seconds."
   }
+}
+
+# VMs created within this window count as in-flight supply when the reconciler
+# computes per-label deficits, so it does not re-create the runners it spun up
+# on the previous pass (the root cause of burst over-provisioning).
+variable "github_runners_reconciler_inflight_window_seconds" {
+  description = "Reconciler treats VMs younger than this as in-flight supply"
+  type        = number
+  default     = 180
+  nullable    = false
+}
+
+# Hard cap on VM-creates per label per reconciler pass. Backstop against
+# runaway creation; the webhook path is the primary creator.
+variable "github_runners_reconciler_max_creates_per_pass" {
+  description = "Max VMs the reconciler will create per label per pass"
+  type        = number
+  default     = 100
+  nullable    = false
+}
+
+# When true, runners register with --ephemeral and are deleted after one job.
+# When false (default), runners stay registered and serve multiple jobs; the
+# sweeper reaps idle ones. Reuse avoids per-job cold-boot and cuts VM churn.
+variable "github_runners_ephemeral" {
+  description = "Use single-use ephemeral runners (true) or reusable runners (false)"
+  type        = bool
+  default     = false
+  nullable    = false
+}
+
+# Cloud Tasks dispatch rate limits (webhook -> /internal -> instances.insert).
+# A moderate cap smooths GCE insert load. Token caching means a high rate is
+# safe from GitHub's secondary rate limit.
+variable "github_runners_tasks_max_dispatches_per_second" {
+  description = "Cloud Tasks max dispatches/sec for the workflow-job queue"
+  type        = number
+  default     = 50
+  nullable    = false
+}
+
+variable "github_runners_tasks_max_concurrent_dispatches" {
+  description = "Cloud Tasks max concurrent dispatches for the workflow-job queue"
+  type        = number
+  default     = 100
+  nullable    = false
+}
+
+# Run runner VMs as Spot instances (~60-70% cheaper than on-demand). CI jobs
+# are interruptible: a preempted job re-queues and re-runs, and the VM is
+# DELETED on preemption (termination_action). Set false to use on-demand
+# STANDARD VMs (e.g. if preemption-driven re-runs ever hurt a critical path).
+variable "github_runners_spot" {
+  description = "Provision runner VMs as Spot instances (cheaper, preemptible)"
+  type        = bool
+  default     = true
+  nullable    = false
 }
 
 # Cron schedule for the orphan-runner sweeper job.
@@ -495,14 +556,18 @@ variable "github_runners_types" {
       arch                        = "arm64"
     },
     {
-      name                        = "gcp-ubuntu-24-04-2core-arm"
-      instance_type               = "c4a-standard-2"
-      vcpu                        = 2
-      memory                      = 8
-      disk_type                   = "hyperdisk-balanced"
-      disk_size                   = 75
-      disk_provisioned_iops       = 3450
-      disk_provisioned_throughput = 252
+      name          = "gcp-ubuntu-24-04-2core-arm"
+      instance_type = "c4a-standard-2"
+      vcpu          = 2
+      memory        = 8
+      disk_type     = "hyperdisk-balanced"
+      # Right-sized for ephemeral/reusable CI runners: ample capacity for the
+      # ~30 GB baked image + working space, and provisioned IOPS/throughput
+      # just above the free hyperdisk-balanced baseline (3000 IOPS / 140 MB/s)
+      # — eliminating the per-VM-hour surcharge that dominated disk cost.
+      disk_size                   = 50
+      disk_provisioned_iops       = 3060
+      disk_provisioned_throughput = 155
       image                       = "ubuntu-2404-lts-arm64"
       arch                        = "arm64"
     },
@@ -512,9 +577,9 @@ variable "github_runners_types" {
       vcpu                        = 4
       memory                      = 16
       disk_type                   = "hyperdisk-balanced"
-      disk_size                   = 150
-      disk_provisioned_iops       = 3900
-      disk_provisioned_throughput = 365
+      disk_size                   = 80
+      disk_provisioned_iops       = 3060
+      disk_provisioned_throughput = 155
       image                       = "ubuntu-2404-lts-arm64"
       arch                        = "arm64"
     },
@@ -524,9 +589,9 @@ variable "github_runners_types" {
       vcpu                        = 8
       memory                      = 32
       disk_type                   = "hyperdisk-balanced"
-      disk_size                   = 300
-      disk_provisioned_iops       = 4800
-      disk_provisioned_throughput = 590
+      disk_size                   = 120
+      disk_provisioned_iops       = 3060
+      disk_provisioned_throughput = 155
       image                       = "ubuntu-2404-lts-arm64"
       arch                        = "arm64"
     },
