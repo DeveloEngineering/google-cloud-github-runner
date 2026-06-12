@@ -20,6 +20,13 @@ output "github_runners_workflow_job_queue" {
   value = google_cloud_tasks_queue.workflow_job_queue.name
 }
 
+# Name of the GCS bucket that CI jobs use to share the workspace tarball.
+# Wire this value into develo-emr's ci.yml (GCS_WORKSPACE_BUCKET) and the
+# restore-workspace composite action.
+output "github_runners_ci_workspace_bucket" {
+  value = module.gcs-github-runners-ci-workspace.name
+}
+
 # Generate Cloud Build configuration for building the manager container image
 resource "local_file" "cloudbuild-github-runners-manager-config" {
   filename        = "${path.module}/cloudbuild-container.yaml"
