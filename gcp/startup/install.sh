@@ -350,6 +350,7 @@ develo_prepull_images() {
                 echo "  WARN: gcloud auth configure-docker failed; AR pulls may be skipped"
         local DEVELO_IMAGES=(
                 "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/postgres:14"
+                "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/pgvector/pgvector:pg14"
                 "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/redis:7"
                 "public.ecr.aws/localstack/localstack:4.14.0"
                 "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/hlnconsulting/ice:2.57.1"
