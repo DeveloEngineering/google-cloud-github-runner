@@ -461,3 +461,77 @@ class TestGCloudClientDeliveryIdLogging:
         assert any(
             "gce-delerr-delivery-001" in r.message for r in caplog.records
         ), "delivery_id not found in error log on instance deletion failure"
+
+
+class TestDeadOnArrivalDetection:
+    """Detects runner VMs that stopped before they could have run a job.
+
+    Regression cover for 2026-08-10: GitHub deprecated the runner version baked
+    into the VM image, so runners registered, exited immediately and powered off.
+    Lifetime is the signal that separates that from healthy work — real jobs in
+    this fleet take minutes; a runner that never got one dies in ~100s.
+    """
+
+    @staticmethod
+    def _inst(name, created, stopped=None):
+        m = MagicMock()
+        m.name = name
+        m.creation_timestamp = created
+        m.last_stop_timestamp = stopped or ''
+        return m
+
+    def test_lifetime_of_a_stopped_instance(self):
+        i = self._inst('gcp-runner-1', '2026-08-10T11:48:47-07:00', '2026-08-10T11:50:28-07:00')
+        assert GCloudClient.instance_lifetime_seconds(i) == 101
+
+    def test_lifetime_handles_mixed_offsets(self):
+        i = self._inst('gcp-runner-1', '2026-08-10T18:48:47+00:00', '2026-08-10T11:50:28-07:00')
+        assert GCloudClient.instance_lifetime_seconds(i) == 101
+
+    def test_lifetime_is_none_while_still_running(self):
+        assert GCloudClient.instance_lifetime_seconds(
+            self._inst('gcp-runner-1', '2026-08-10T11:48:47-07:00')
+        ) is None
+
+    def test_lifetime_is_none_when_unparseable(self):
+        assert GCloudClient.instance_lifetime_seconds(
+            self._inst('gcp-runner-1', 'not-a-timestamp', 'also-not')
+        ) is None
+
+    def test_lifetime_is_none_without_creation_timestamp(self):
+        assert GCloudClient.instance_lifetime_seconds(
+            self._inst('gcp-runner-1', '', '2026-08-10T11:50:28-07:00')
+        ) is None
+
+    @patch('app.clients.gcloud_client.compute_v1')
+    def test_count_dead_on_arrival(self, mock_compute, mock_env_vars):
+        instances = [
+            # registered, exited, powered off after 101s → dead on arrival
+            self._inst('gcp-runner-1', '2026-08-10T11:48:47-07:00', '2026-08-10T11:50:28-07:00'),
+            self._inst('gcp-runner-2', '2026-08-10T11:48:48-07:00', '2026-08-10T11:50:29-07:00'),
+            # ran a real 20-minute job → not dead on arrival
+            self._inst('gcp-runner-3', '2026-08-10T11:00:00-07:00', '2026-08-10T11:20:00-07:00'),
+            # still booting or busy → no stop timestamp → ignored
+            self._inst('gcp-runner-4', '2026-08-10T11:48:49-07:00'),
+        ]
+        mock_instance_client = MagicMock()
+        mock_instance_client.list.return_value = iter(instances)
+        mock_compute.InstancesClient.return_value = mock_instance_client
+
+        client = GCloudClient()
+
+        assert client.count_dead_on_arrival(max_lifetime_seconds=180) == 2
+
+    @patch('app.clients.gcloud_client.compute_v1')
+    def test_count_dead_on_arrival_respects_threshold(self, mock_compute, mock_env_vars):
+        instances = [
+            self._inst('gcp-runner-1', '2026-08-10T11:48:47-07:00', '2026-08-10T11:50:28-07:00'),  # 101s
+        ]
+        mock_instance_client = MagicMock()
+        mock_instance_client.list.return_value = iter(instances)
+        mock_compute.InstancesClient.return_value = mock_instance_client
+
+        client = GCloudClient()
+
+        # A tighter threshold no longer classifies a 101s VM as dead on arrival.
+        assert client.count_dead_on_arrival(max_lifetime_seconds=60) == 0
