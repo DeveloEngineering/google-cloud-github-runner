@@ -270,7 +270,45 @@ Example:
 The script will create a custom image based on the specified image name.
 During startup, the script [startup/install.sh](startup/install.sh) will be executed.
 
-> **Note:** Rebuild custom images regularly to update the OS and GitHub Actions Runner with the latest security patches and features. Keeping the base image up to date is essential for maintaining a secure and stable CI/CD environment.
+Before promoting the builder VM's disk to the image family, the script verifies
+the `develo/bake-status` guest attribute that `install.sh` writes as its very
+last action. This matters because `install.sh` powers the VM off via an `EXIT`
+trap on failure as well as success, and GCE discards serial console output once
+an instance stops — so `TERMINATED` alone says nothing about whether the bake
+worked. If the attribute is missing the script refuses to publish, leaves the
+builder VM in place for inspection, and exits non-zero. The previous good image
+stays in the family.
+
+The script also prints the `actions/runner` version it baked, and records it
+both in the image description and in an image label (`runner-version`), so you
+can see what a family is carrying without booting it:
+
+```bash
+gcloud compute images list --project [PROJECT_ID] --no-standard-images \
+  --format="table(name,family,creationTimestamp,labels.runner-version)"
+```
+
+### Automatic rebake
+
+A Cloud Run job rebakes every image family on a Cloud Scheduler cron
+(`github_runners_image_rebake_schedule`, monthly by default). It runs the same
+`build-image-*.sh` scripts, fetched from GCS, so there is only one bake path.
+Set `github_runners_image_rebake_enabled = false` to keep the job deployed but
+never triggered automatically.
+
+To rebake everything on demand:
+
+```bash
+gcloud run jobs execute [REBAKE_JOB_NAME] --region [REGION] --wait
+```
+
+> **Note:** `install.sh` installs whatever `actions/runner` release is latest at
+> bake time, so an image's runner version is frozen the moment it is baked.
+> GitHub hard-deprecates old runner versions, and a deprecated runner registers
+> successfully and then refuses to accept work — which presents as a healthy
+> control plane with every job stuck in `queued`. Runners self-update, so a
+> stale image is not fatal, but rebaking on a schedule keeps that path cold and
+> keeps the OS and pre-baked tool caches patched.
 
 ## Default Machine Sizes for Runners
 

@@ -8,7 +8,10 @@ module "service-account-compute-vm-github-runners" {
   display_name = "Compute VM - GitHub Actions Runners (Terraform managed)"
   iam = {
     "roles/iam.serviceAccountUser" = [
-      module.service-account-cloud-run-github-runners-manager.iam_email
+      module.service-account-cloud-run-github-runners-manager.iam_email,
+      # The periodic image-rebake job creates builder VMs that run as this SA
+      # (build-image-*.sh passes it to `gcloud compute instances create`).
+      module.service-account-image-rebake.iam_email,
     ]
   }
   iam_project_roles = {

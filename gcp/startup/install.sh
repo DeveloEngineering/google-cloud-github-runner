@@ -235,8 +235,19 @@ echo "GitHub Actions Runner installed successfully"
 # Marker file so we can grep for it on a baked image to confirm runner install
 # made it in. Future operators (or a verification step in build-image.sh) can
 # look for this file before promoting an image.
+#
+# The runner version is recorded here because it is otherwise invisible on a
+# baked image: install.sh always installs "whatever actions/runner release is
+# latest at bake time", so the only way to know what a given image family is
+# carrying is to boot it and look. GitHub hard-deprecates old runner versions,
+# so "which version is baked in" is the number that decides whether the fleet
+# can pick up jobs at all.
 sudo install -m 0644 /dev/null /etc/develo-runner-image-ready
-echo "runner_installed=1" | sudo tee -a /etc/develo-runner-image-ready >/dev/null
+{
+        echo "runner_installed=1"
+        echo "runner_version=${MY_RUNNER_VERSION}"
+        echo "baked_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} | sudo tee -a /etc/develo-runner-image-ready >/dev/null
 
 # Helper: run a develo optimization block with errors logged but NOT fatal.
 # Every block below is OPTIONAL — failures should leave a degraded-but-working
@@ -379,6 +390,32 @@ sudo find /var/log -type f \( -name "*.gz" -o -regex ".*\.[0-9]$" \) -delete
 sudo find /var/log -type f -exec truncate -s 0 {} +
 
 echo "Setup completed successfully"
+
+# ─── Publish bake status for build-image.sh to verify ────────────────────────
+# The EXIT trap powers this VM off whether the bake succeeded OR failed, and
+# GCE discards serial console output once an instance stops. So after the fact
+# "TERMINATED" is all build-image.sh can see, and it cannot tell a good bake
+# from a bad one — it would happily promote a broken disk to the image family
+# that every runner VM boots from.
+#
+# Guest attributes fix that: they live on the instance resource, so they
+# outlive the guest and are readable with `gcloud compute instances
+# get-guest-attributes` after shutdown. Writing this as the very LAST action
+# means the attribute exists only if everything above succeeded — any earlier
+# `set -e` exit skips it and build-image.sh refuses to publish the image.
+#
+# Requires `enable-guest-attributes=TRUE` in instance metadata (set by
+# build-image.sh). If it is absent — a hand-rolled or legacy build — the PUT
+# fails harmlessly and we say so rather than failing the whole bake.
+readonly MY_GUEST_ATTR_URL="http://metadata.google.internal/computeMetadata/v1/instance/guest-attributes/develo/bake-status"
+if curl -fsS -X PUT --data "ok runner_version=${MY_RUNNER_VERSION}" \
+        -H "Metadata-Flavor: Google" "$MY_GUEST_ATTR_URL" >/dev/null 2>&1; then
+        echo "Published bake status: ok runner_version=${MY_RUNNER_VERSION}"
+else
+        echo "WARN: could not publish bake-status guest attribute (is" \
+                "enable-guest-attributes=TRUE set on this VM?). build-image.sh" \
+                "will treat this bake as unverified." >&2
+fi
 
 # Shutdown is handled by the EXIT trap at the top of this script — do not add
 # `shutdown -h now` here, or it would race the trap.
