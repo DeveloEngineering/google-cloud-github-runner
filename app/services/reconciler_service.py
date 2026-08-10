@@ -33,6 +33,30 @@ signature of an actually-missed webhook.
 The reconciler runs on a Cloud Scheduler cron (see ``scheduler.tf``). It only
 considers jobs older than ``GITHUB_RECONCILER_MIN_JOB_AGE_SECONDS`` so it does
 not race in-flight webhook deliveries that may still arrive on their own.
+
+Circuit breaker
+---------------
+Supply/demand accounting assumes a created VM will eventually do work. When
+that assumption breaks — GitHub deprecates the runner version baked into the
+image, the image is broken, registration tokens are rejected — every VM boots,
+dies, and drops out of the supply count, so the reconciler sees a permanent
+deficit and recreates the fleet every pass forever. That is not a recovery, it
+is a spend loop: on 2026-08-10 it ran ~3 hours at ~40 VMs per 2 minutes and
+executed zero jobs.
+
+The breaker refuses to create when both of these hold:
+
+  * NO gcp-labelled job anywhere is ``in_progress`` — nothing is working, so
+    this is systemic rather than a normal queue waiting its turn; and
+  * at least ``GITHUB_RECONCILER_BREAKER_MIN_DOA`` runner VMs are
+    dead-on-arrival — they stopped within
+    ``GITHUB_RECONCILER_BREAKER_MAX_LIFETIME_SECONDS`` of being created, i.e.
+    they never lived long enough to have run a job.
+
+Requiring both keeps a cold burst (demand, no supply, nothing in progress yet,
+no corpses) from tripping it, and keeps a fleet of fast short jobs (corpses,
+but jobs demonstrably progressing) from tripping it either. Set
+``GITHUB_RECONCILER_BREAKER_MIN_DOA=0`` to disable.
 """
 import logging
 import os
@@ -51,6 +75,11 @@ REQUEST_TIMEOUT = 30  # seconds, matches github_client
 DEFAULT_MIN_AGE_SECONDS = 120
 DEFAULT_INFLIGHT_WINDOW_SECONDS = 180
 DEFAULT_MAX_CREATES_PER_PASS = 100
+# Runner VMs that stopped within this many seconds of creation never lived long
+# enough to have run a job (boot alone is ~20-40s).
+DEFAULT_BREAKER_MAX_LIFETIME_SECONDS = 180
+# How many dead-on-arrival VMs, with nothing in progress, before we stop creating.
+DEFAULT_BREAKER_MIN_DOA = 5
 
 
 def _int_env(name, default):
@@ -96,6 +125,15 @@ class ReconcilerService:
         self.max_creates_per_pass = _int_env(
             'GITHUB_RECONCILER_MAX_CREATES_PER_PASS', DEFAULT_MAX_CREATES_PER_PASS
         )
+        # Circuit breaker: stop creating when runners are provably unable to
+        # work. See the module docstring. 0 disables the breaker entirely.
+        self.breaker_min_doa = _int_env(
+            'GITHUB_RECONCILER_BREAKER_MIN_DOA', DEFAULT_BREAKER_MIN_DOA
+        )
+        self.breaker_max_lifetime_seconds = _int_env(
+            'GITHUB_RECONCILER_BREAKER_MAX_LIFETIME_SECONDS',
+            DEFAULT_BREAKER_MAX_LIFETIME_SECONDS,
+        )
 
     def reconcile(self, target_url: str) -> dict:
         """Run one capacity-aware reconciliation pass.
@@ -129,7 +167,10 @@ class ReconcilerService:
             'jobs_skipped_young': 0,
             'jobs_skipped_no_label': 0,
             'jobs_skipped_have_capacity': 0,
+            'jobs_skipped_breaker_open': 0,
             'errors': 0,
+            'jobs_in_progress': 0,
+            'circuit_breaker': 'closed',
             'by_label': {},
             'enqueued_job_ids': [],
         }
@@ -158,6 +199,10 @@ class ReconcilerService:
 
                 for job in jobs:
                     result['jobs_inspected'] += 1
+                    # Any gcp-labelled job actually running proves the fleet can
+                    # work; the circuit breaker below keys off this.
+                    if job.get('status') == 'in_progress' and self._gcp_label(job) is not None:
+                        result['jobs_in_progress'] += 1
                     eligibility = self._classify(job, now)
                     if eligibility == 'young':
                         result['jobs_skipped_young'] += 1
@@ -177,6 +222,13 @@ class ReconcilerService:
             result['errors'] += 1
             supply_by_label = {}
 
+        # ── Circuit breaker: are the runners we create able to work at all? ──
+        breaker_open = self._breaker_open(
+            demand_by_label=demand_by_label,
+            jobs_in_progress=result['jobs_in_progress'],
+            result=result,
+        )
+
         # ── Phase 3: enqueue only the deficit, oldest-first, capped ──
         for label, items in demand_by_label.items():
             demand = len(items)
@@ -185,12 +237,21 @@ class ReconcilerService:
             # Cap how many we create this pass; the rest recover next pass once
             # this batch is counted as in-flight supply.
             to_create = min(deficit, self.max_creates_per_pass)
+            if breaker_open:
+                # Creating more VMs cannot help — they would die the same way.
+                # Report the real deficit but create nothing.
+                to_create = 0
             result['by_label'][label] = {
                 'demand': demand, 'supply': supply,
                 'deficit': deficit, 'creating': to_create,
             }
             if to_create == 0:
-                result['jobs_skipped_have_capacity'] += demand
+                # Distinguish "the fleet already covers this" from "we refused
+                # to create" — they need very different operator responses.
+                if breaker_open:
+                    result['jobs_skipped_breaker_open'] += demand
+                else:
+                    result['jobs_skipped_have_capacity'] += demand
                 continue
 
             # Oldest jobs first — bounds worst-case wait for any single job.
@@ -215,6 +276,56 @@ class ReconcilerService:
 
         logger.info("Reconcile pass: %s", result)
         return result
+
+    # ------------------------------------------------------------------
+    # Circuit breaker
+    # ------------------------------------------------------------------
+
+    def _breaker_open(self, demand_by_label, jobs_in_progress, result) -> bool:
+        """Decide whether to refuse creating runners this pass.
+
+        Opens only when the fleet is provably unable to work: nothing is
+        ``in_progress`` AND enough runner VMs died before they could possibly
+        have run a job. See the module docstring for why both conditions are
+        required. Records the reason in ``result['circuit_breaker']``.
+        """
+        if self.breaker_min_doa <= 0:
+            result['circuit_breaker'] = 'disabled'
+            return False
+        if not demand_by_label:
+            return False
+        if jobs_in_progress > 0:
+            # Jobs are running, so runners demonstrably work. Any queue here is
+            # ordinary backlog, not a systemic failure.
+            return False
+
+        try:
+            doa = self.gcloud_client.count_dead_on_arrival(
+                max_lifetime_seconds=self.breaker_max_lifetime_seconds
+            )
+        except Exception as e:
+            # Fail closed-as-in-keep-working: if we cannot measure, behave as
+            # before rather than stalling the recovery path.
+            logger.warning("Circuit breaker could not count dead-on-arrival VMs: %s", e)
+            result['errors'] += 1
+            return False
+
+        result['dead_on_arrival'] = doa
+        if doa < self.breaker_min_doa:
+            return False
+
+        result['circuit_breaker'] = 'open'
+        logger.error(
+            "Reconciler circuit breaker OPEN: %d runner VMs stopped within %ds of "
+            "creation and no gcp-labelled job is in progress. Runners are registering "
+            "and dying without claiming work — refusing to create more. Likely causes: "
+            "the actions/runner version baked into the VM image has been deprecated by "
+            "GitHub, a broken VM image, or rejected registration tokens. Check a runner "
+            "VM's serial console output. Set GITHUB_RECONCILER_BREAKER_MIN_DOA=0 to "
+            "override.",
+            doa, self.breaker_max_lifetime_seconds,
+        )
+        return True
 
     # ------------------------------------------------------------------
     # GitHub API helpers

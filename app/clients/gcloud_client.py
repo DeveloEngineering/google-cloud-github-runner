@@ -326,6 +326,36 @@ class GCloudClient:
                 counts[label] = counts.get(label, 0) + 1
         return counts
 
+    def count_dead_on_arrival(self, max_lifetime_seconds=180):
+        """
+        Count runner VMs that powered themselves off almost immediately.
+
+        A runner that boots, registers and then exits WITHOUT claiming a job
+        stops within roughly two minutes (boot + config.sh + immediate exit +
+        ``shutdown -h now``). A runner that actually ran a job lives far
+        longer — the shortest real job in this fleet takes minutes. So a batch
+        of very short-lived, already-stopped runner VMs is a strong signal for
+        "we can create runners but they cannot work": a GitHub runner-version
+        deprecation, a broken VM image, or a bad registration token.
+
+        Only VMs that have already stopped are counted. A VM still booting has
+        no ``last_stop_timestamp`` and is ignored, so this never mistakes
+        healthy in-flight capacity for a failure.
+
+        Args:
+            max_lifetime_seconds: a stopped VM whose whole life was shorter
+                than this counts as dead-on-arrival.
+
+        Returns:
+            int: number of dead-on-arrival runner VMs still visible in the zone.
+        """
+        count = 0
+        for instance in self.list_runner_instances():
+            lifetime = self.instance_lifetime_seconds(instance)
+            if lifetime is not None and lifetime < max_lifetime_seconds:
+                count += 1
+        return count
+
     @staticmethod
     def instance_age_seconds(instance):
         """
@@ -344,3 +374,28 @@ class GCloudClient:
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - created).total_seconds()
+
+    @staticmethod
+    def instance_lifetime_seconds(instance):
+        """
+        Return how many seconds an instance lived — creation until it stopped —
+        or None if it has not stopped yet or the timestamps are unparseable.
+        """
+        created_ts = instance.creation_timestamp
+        stopped_ts = instance.last_stop_timestamp
+        if not created_ts or not stopped_ts:
+            return None
+        try:
+            created = datetime.fromisoformat(created_ts)
+            stopped = datetime.fromisoformat(stopped_ts)
+        except ValueError:
+            logger.warning(
+                "Could not parse instance timestamps creation='%s' last_stop='%s'",
+                created_ts, stopped_ts,
+            )
+            return None
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if stopped.tzinfo is None:
+            stopped = stopped.replace(tzinfo=timezone.utc)
+        return (stopped - created).total_seconds()
