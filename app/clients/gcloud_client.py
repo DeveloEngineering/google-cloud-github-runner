@@ -162,7 +162,19 @@ class GCloudClient:
             f"{ephemeral_flag}"
             "--unattended "
             "--no-default-labels "
-            "--disableupdate && "
+            # Deliberately NOT --disableupdate. GitHub hard-deprecates old
+            # runner versions: the listener exits immediately with "Runner
+            # version vX.Y.Z is deprecated and cannot receive messages" and the
+            # VM never claims a job. With updates disabled, the version baked
+            # into the VM image is frozen, so a deprecation takes the whole
+            # fleet down until someone rebakes the image by hand — and because
+            # the runner still *registers* successfully before dying, the
+            # control plane looks perfectly healthy while every job sits queued.
+            # Letting the runner self-update costs a one-off download on a stale
+            # image and makes that failure mode self-healing instead of fatal.
+            # The scheduled image rebake keeps the baked version current so this
+            # path is rarely exercised.
+            "&& "
             "sudo -u runner ./run.sh; "
             # Self-clean: once the runner process exits — ephemeral job done, or
             # config failed, or the runner was deregistered in reusable mode —
