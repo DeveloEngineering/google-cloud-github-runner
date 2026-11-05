@@ -60,9 +60,9 @@ export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
 #   PLAYWRIGHT_VERSION ↔ @playwright/test in develo-emr/e2e/package.json
 #   YARN_VERSION       ↔ packageManager in develo-emr/package.json
 # Mismatch is non-fatal: CI falls back to download-at-runtime.
-readonly DEVELO_NODE_VERSION="24.13.0"
+readonly DEVELO_NODE_VERSION="24.22.1"
 readonly DEVELO_PLAYWRIGHT_VERSION="1.58.2"
-readonly DEVELO_YARN_VERSION="4.14.1"
+readonly DEVELO_YARN_VERSION="4.17.1"
 readonly DEVELO_AR_PROJECT="gh-runners-496913"
 readonly DEVELO_AR_LOCATION="us-central1"
 readonly DEVELO_AR_REPO="ci-image-mirror"
@@ -349,8 +349,8 @@ develo_prepull_images() {
                 "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/postgres:14"
                 "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/redis:7"
                 "public.ecr.aws/localstack/localstack:4.14.0"
-                "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/hlnconsulting/ice:2.57.1"
-                "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/medplum/medplum-server:3.3.0"
+                "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/hlnconsulting/ice:2.60.1"
+                "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/medplum/medplum-server:5.1.42"
                 "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/mockserver/mockserver:5.15.0"
                 "${DEVELO_AR_REGISTRY}/${DEVELO_AR_PROJECT}/${DEVELO_AR_REPO}/atmoz/sftp:latest"
         )
