@@ -299,7 +299,8 @@ class TestRunnerManagement:
     @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
     def test_delete_runner_success(self, mock_tok, mock_del, mock_env_vars):
         from unittest.mock import MagicMock
-        resp = MagicMock(); resp.status_code = 204
+        resp = MagicMock()
+        resp.status_code = 204
         mock_del.return_value = resp
         client = GitHubClient()
         assert client.delete_runner(5, org_name='DeveloEngineering') is True
@@ -308,7 +309,9 @@ class TestRunnerManagement:
     @patch.object(GitHubClient, 'get_installation_access_token', return_value='tok')
     def test_delete_runner_busy_returns_false(self, mock_tok, mock_del, mock_env_vars):
         from unittest.mock import MagicMock
-        resp = MagicMock(); resp.status_code = 422; resp.text = 'busy'
+        resp = MagicMock()
+        resp.status_code = 422
+        resp.text = 'busy'
         mock_del.return_value = resp
         client = GitHubClient()
         assert client.delete_runner(5, org_name='DeveloEngineering') is False
