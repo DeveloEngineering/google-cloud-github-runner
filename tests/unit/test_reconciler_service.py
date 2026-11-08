@@ -73,12 +73,17 @@ class TestClassify:
 
 
 class TestCapacityAwareReconcile:
-    def _wire(self, svc, jobs, live_by_label):
-        """Stub the GitHub API + GCE calls for a single-repo single-run pass."""
+    def _wire(self, svc, jobs, live_by_label, dead_on_arrival=0):
+        """Stub the GitHub API + GCE calls for a single-repo single-run pass.
+
+        ``dead_on_arrival`` defaults to 0 — no runner VMs died prematurely, the
+        healthy case, so the circuit breaker stays closed.
+        """
         svc._list_installation_repos = MagicMock(return_value=[_repo()])
         svc._list_active_runs = MagicMock(return_value=[{'id': 999}])
         svc._list_run_jobs = MagicMock(return_value=jobs)
         svc.gcloud_client.count_supply_by_label = MagicMock(return_value=live_by_label)
+        svc.gcloud_client.count_dead_on_arrival = MagicMock(return_value=dead_on_arrival)
         svc.tasks_client.enqueue_workflow_job = MagicMock()
 
     def test_no_enqueue_when_supply_meets_demand(self, svc):
@@ -202,3 +207,148 @@ class TestSyntheticPayload:
         )
         _, kwargs = svc.tasks_client.enqueue_workflow_job.call_args
         assert 'organization' not in kwargs['payload']
+
+
+def _build_svc(monkeypatch, **env):
+    """Construct a ReconcilerService with extra env vars applied."""
+    monkeypatch.setenv('GITHUB_APP_ID', '1')
+    monkeypatch.setenv('GITHUB_INSTALLATION_ID', '1')
+    monkeypatch.setenv('GITHUB_PRIVATE_KEY', '-----BEGIN-----\ndummy\n-----END-----')
+    monkeypatch.setenv('GOOGLE_CLOUD_PROJECT', 'test')
+    monkeypatch.setenv('TASKS_QUEUE_PROJECT', 'test')
+    monkeypatch.setenv('TASKS_QUEUE_LOCATION', 'us-central1')
+    monkeypatch.setenv('TASKS_QUEUE_NAME', 'q')
+    monkeypatch.setenv('TASKS_INVOKER_SERVICE_ACCOUNT_EMAIL', 'invoker@test.iam.gserviceaccount.com')
+    monkeypatch.setenv('GITHUB_RECONCILER_MIN_JOB_AGE_SECONDS', '60')
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    with patch('app.services.reconciler_service.CloudTasksClient'), \
+         patch('app.services.reconciler_service.GCloudClient'), \
+         patch('app.services.reconciler_service.GitHubClient'):
+        from app.services.reconciler_service import ReconcilerService
+        return ReconcilerService()
+
+
+class TestCircuitBreaker:
+    """The breaker stops the reconciler recreating a fleet that cannot work.
+
+    Regression cover for 2026-08-10: GitHub deprecated the runner version baked
+    into the VM image, so every runner registered, exited without claiming a
+    job, and self-shut-down. Supply dropped to ~0 each pass, so the reconciler
+    saw a permanent deficit and recreated ~40 VMs every 2 minutes for ~3 hours
+    while executing zero jobs.
+    """
+
+    URL = 'https://x/internal/process-workflow-job'
+
+    def _wire(self, svc, jobs, live_by_label, dead_on_arrival):
+        svc._list_installation_repos = MagicMock(return_value=[_repo()])
+        svc._list_active_runs = MagicMock(return_value=[{'id': 999}])
+        svc._list_run_jobs = MagicMock(return_value=jobs)
+        svc.gcloud_client.count_supply_by_label = MagicMock(return_value=live_by_label)
+        svc.gcloud_client.count_dead_on_arrival = MagicMock(return_value=dead_on_arrival)
+        svc.tasks_client.enqueue_workflow_job = MagicMock()
+
+    def _queued(self, n, label='gcp-ubuntu-24-04-4core-arm'):
+        jobs = []
+        for i in range(n):
+            j = _job(i, started_at=_old_ts())
+            j['labels'] = [label]
+            jobs.append(j)
+        return jobs
+
+    def test_opens_when_runners_die_and_nothing_is_running(self, svc):
+        # 6 queued jobs, no supply, 10 VMs died on arrival, nothing in progress.
+        self._wire(svc, self._queued(6), {}, dead_on_arrival=10)
+
+        result = svc.reconcile(target_url=self.URL)
+
+        assert result['circuit_breaker'] == 'open'
+        assert result['dead_on_arrival'] == 10
+        assert result['jobs_enqueued'] == 0
+        assert result['jobs_skipped_breaker_open'] == 6
+        # The real deficit is still reported so operators can see the backlog.
+        assert result['by_label']['gcp-ubuntu-24-04-4core-arm']['deficit'] == 6
+        assert result['by_label']['gcp-ubuntu-24-04-4core-arm']['creating'] == 0
+        svc.tasks_client.enqueue_workflow_job.assert_not_called()
+
+    def test_stays_closed_while_any_gcp_job_is_in_progress(self, svc):
+        # Corpses exist, but a job is running — runners demonstrably work, so
+        # the queue is ordinary backlog and the reconciler must keep helping.
+        jobs = self._queued(6)
+        running = _job(500, status='in_progress')
+        running['labels'] = ['gcp-ubuntu-24-04-4core-arm']
+        jobs.append(running)
+        self._wire(svc, jobs, {}, dead_on_arrival=40)
+
+        result = svc.reconcile(target_url=self.URL)
+
+        assert result['circuit_breaker'] == 'closed'
+        assert result['jobs_in_progress'] == 1
+        assert result['jobs_enqueued'] == 6
+        svc.gcloud_client.count_dead_on_arrival.assert_not_called()
+
+    def test_stays_closed_on_a_cold_burst(self, svc):
+        # Nothing running and no supply yet, but nothing has died either —
+        # this is just a fan-out starting from zero.
+        self._wire(svc, self._queued(6), {}, dead_on_arrival=0)
+
+        result = svc.reconcile(target_url=self.URL)
+
+        assert result['circuit_breaker'] == 'closed'
+        assert result['jobs_enqueued'] == 6
+
+    def test_stays_closed_below_threshold(self, svc):
+        # A couple of short-lived VMs is normal (fast jobs, spot reclaim).
+        self._wire(svc, self._queued(6), {}, dead_on_arrival=4)
+
+        result = svc.reconcile(target_url=self.URL)
+
+        assert result['circuit_breaker'] == 'closed'
+        assert result['jobs_enqueued'] == 6
+
+    def test_can_be_disabled(self, monkeypatch):
+        svc = _build_svc(monkeypatch, GITHUB_RECONCILER_BREAKER_MIN_DOA='0')
+        self._wire(svc, self._queued(6), {}, dead_on_arrival=999)
+
+        result = svc.reconcile(target_url=self.URL)
+
+        assert result['circuit_breaker'] == 'disabled'
+        assert result['jobs_enqueued'] == 6
+        svc.gcloud_client.count_dead_on_arrival.assert_not_called()
+
+    def test_honours_custom_threshold(self, monkeypatch):
+        svc = _build_svc(monkeypatch, GITHUB_RECONCILER_BREAKER_MIN_DOA='2')
+        self._wire(svc, self._queued(3), {}, dead_on_arrival=2)
+
+        result = svc.reconcile(target_url=self.URL)
+
+        assert result['circuit_breaker'] == 'open'
+        assert result['jobs_enqueued'] == 0
+
+    def test_counting_failure_does_not_block_recovery(self, svc):
+        # If we cannot measure, behave as before rather than stalling recovery.
+        self._wire(svc, self._queued(6), {}, dead_on_arrival=0)
+        svc.gcloud_client.count_dead_on_arrival = MagicMock(side_effect=Exception('GCE down'))
+
+        result = svc.reconcile(target_url=self.URL)
+
+        assert result['circuit_breaker'] == 'closed'
+        assert result['jobs_enqueued'] == 6
+        assert result['errors'] == 1
+
+    def test_no_demand_never_consults_gce(self, svc):
+        self._wire(svc, [], {}, dead_on_arrival=99)
+
+        result = svc.reconcile(target_url=self.URL)
+
+        assert result['circuit_breaker'] == 'closed'
+        svc.gcloud_client.count_dead_on_arrival.assert_not_called()
+
+    def test_breaker_max_lifetime_is_passed_through(self, monkeypatch):
+        svc = _build_svc(monkeypatch, GITHUB_RECONCILER_BREAKER_MAX_LIFETIME_SECONDS='240')
+        self._wire(svc, self._queued(6), {}, dead_on_arrival=10)
+
+        svc.reconcile(target_url=self.URL)
+
+        svc.gcloud_client.count_dead_on_arrival.assert_called_once_with(max_lifetime_seconds=240)
