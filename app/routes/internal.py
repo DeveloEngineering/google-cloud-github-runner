@@ -17,7 +17,6 @@ from flask import Blueprint, request, jsonify
 
 from app.services import WebhookService
 from app.utils.auth import verify_scheduler_oidc_token
-from app import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +24,6 @@ internal_bp = Blueprint('internal', __name__)
 
 
 @internal_bp.route('/internal/process-workflow-job', methods=['POST'])
-@limiter.limit("5000 per hour")
 def process_workflow_job():
     """Consume one Cloud Tasks delivery and process the underlying workflow_job."""
     if not verify_scheduler_oidc_token(
