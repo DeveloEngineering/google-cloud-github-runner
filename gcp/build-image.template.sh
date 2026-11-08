@@ -111,6 +111,7 @@ if [ -z "$BAKE_STATUS" ]; then
 fi
 
 echo "Bake status: $BAKE_STATUS"
+# shellcheck disable=SC2034  # used below via Terraform-escaped $${BAKED_RUNNER_VERSION}
 BAKED_RUNNER_VERSION=$(echo "$BAKE_STATUS" | sed -n 's/.*runner_version=\([^ ]*\).*/\1/p')
 echo "Baked actions/runner version: $${BAKED_RUNNER_VERSION:-unknown}"
 echo ""
