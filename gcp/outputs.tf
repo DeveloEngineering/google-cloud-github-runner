@@ -14,6 +14,12 @@ output "github_runners_reconciler_job" {
   value = google_cloud_scheduler_job.github_runners_reconciler.name
 }
 
+# Cloud Run job that rebakes the runner VM images. Run it on demand with:
+#   gcloud run jobs execute <name> --region <region> --wait
+output "github_runners_image_rebake_job" {
+  value = google_cloud_run_v2_job.github_runners_image_rebake.name
+}
+
 # Cloud Tasks queue that buffers webhook work between /webhook and
 # /internal/process-workflow-job.
 output "github_runners_workflow_job_queue" {
@@ -104,6 +110,7 @@ resource "local_file" "github-runners-images" {
     disk_size                   = can(regex("arm64", each.value)) ? var.github_runners_default_type["arm64"].disk_size : var.github_runners_default_type["amd64"].disk_size
     disk_provisioned_iops       = can(regex("arm64", each.value)) ? var.github_runners_default_type["arm64"].disk_provisioned_iops : var.github_runners_default_type["amd64"].disk_provisioned_iops
     disk_provisioned_throughput = can(regex("arm64", each.value)) ? var.github_runners_default_type["arm64"].disk_provisioned_throughput : var.github_runners_default_type["amd64"].disk_provisioned_throughput
+    bake_timeout_seconds        = var.github_runners_image_bake_timeout_seconds
     zone                        = "${var.region}-${var.zone}"
     region                      = var.region
     project_id                  = module.project.project_id

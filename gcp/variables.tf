@@ -255,6 +255,48 @@ variable "github_runners_orphan_sweep_schedule" {
 }
 
 # Map of default VM images for GitHub Actions Runners by architecture
+# Cloud Scheduler cron for the periodic runner-image rebake.
+#
+# install.sh installs "whatever actions/runner release is latest at bake time",
+# so an image's runner version is frozen the moment it is baked. GitHub
+# hard-deprecates old runner versions, and a runner that is too old registers
+# successfully and then refuses to accept work. Rebaking on a schedule keeps
+# the baked version close to current so the self-update path (see
+# gcloud_client.py) is rarely exercised, and keeps the pre-baked Node/yarn/
+# Playwright/Docker caches fresh.
+#
+# Monthly on the 1st at 09:00 UTC — a Sunday-agnostic quiet slot, and well
+# inside actions/runner's release cadence of roughly one release a month.
+variable "github_runners_image_rebake_schedule" {
+  description = "Cloud Scheduler cron expression for the periodic runner-image rebake"
+  type        = string
+  default     = "0 9 1 * *"
+  nullable    = false
+}
+
+# Set to false to keep the rebake Cloud Run job deployed but never triggered
+# automatically (it can still be run on demand with `gcloud run jobs execute`).
+variable "github_runners_image_rebake_enabled" {
+  description = "Whether Cloud Scheduler automatically triggers the periodic runner-image rebake"
+  type        = bool
+  default     = true
+  nullable    = false
+}
+
+# Upper bound on how long build-image-*.sh waits for install.sh to finish
+# before declaring the bake wedged, dumping serial output and giving up. A
+# full bake is ~7-10 minutes.
+variable "github_runners_image_bake_timeout_seconds" {
+  description = "Seconds build-image-*.sh waits for the builder VM to stop before failing"
+  type        = number
+  default     = 1800 # 30 min — ~3x a normal bake
+
+  validation {
+    condition     = var.github_runners_image_bake_timeout_seconds >= 600
+    error_message = "Bake timeout must be at least 600s; a normal bake takes 7-10 minutes."
+  }
+}
+
 variable "github_runners_default_image" {
   description = "Default GitHub Actions Runners images (family images) for different CPU architectures"
   type        = map(string)

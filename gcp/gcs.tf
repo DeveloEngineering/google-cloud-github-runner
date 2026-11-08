@@ -52,7 +52,10 @@ module "gcs-github-runners-startup-script" {
   force_destroy = true
   iam = {
     "roles/storage.objectViewer" = [
-      module.service-account-compute-vm-github-runners.iam_email
+      module.service-account-compute-vm-github-runners.iam_email,
+      # The periodic image-rebake job reads the generated build-image-*.sh
+      # scripts from this bucket (see image-rebake.tf).
+      module.service-account-image-rebake.iam_email,
     ]
   }
   depends_on = [
