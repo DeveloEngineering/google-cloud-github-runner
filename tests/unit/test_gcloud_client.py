@@ -95,6 +95,11 @@ class TestGCloudClient:
         assert 'sudo -u runner ./config.sh' in startup_script
         assert 'sudo -u runner ./run.sh' in startup_script
         assert '--runnergroup' not in startup_script
+        # Regression guard: with --disableupdate, a runner baked at a version
+        # GitHub later deprecates registers fine and then exits without ever
+        # claiming a job, taking the whole fleet down until the image is
+        # rebaked by hand. Self-update must stay enabled.
+        assert '--disableupdate' not in startup_script
 
     @patch('app.clients.gcloud_client.compute_v1')
     def test_create_runner_instance_with_runner_group(self, mock_compute, monkeypatch, mock_env_vars):

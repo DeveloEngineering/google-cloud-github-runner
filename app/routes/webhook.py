@@ -15,7 +15,6 @@ import logging
 from flask import Blueprint, request, jsonify
 from app.clients import CloudTasksClient
 from app.utils.security import verify_github_signature
-from app import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +22,6 @@ webhook_bp = Blueprint('webhook', __name__)
 
 
 @webhook_bp.route('/webhook', methods=['POST'])
-@limiter.limit("1000 per hour")  # Higher limit for high-traffic webhook endpoint
 def webhook():
     """Receive a GitHub webhook event and enqueue async processing."""
     # https://docs.github.com/en/webhooks/webhook-events-and-payloads

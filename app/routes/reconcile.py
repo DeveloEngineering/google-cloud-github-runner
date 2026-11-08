@@ -7,7 +7,6 @@ from flask import Blueprint, request, jsonify
 
 from app.services import ReconcilerService
 from app.utils.auth import verify_scheduler_oidc_token
-from app import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +14,6 @@ reconcile_bp = Blueprint('reconcile', __name__)
 
 
 @reconcile_bp.route('/reconcile', methods=['POST'])
-@limiter.limit("60 per hour")
 def reconcile():
     """Run one reconciliation pass."""
     # /reconcile is invoked by Cloud Scheduler, which signs with the sweeper

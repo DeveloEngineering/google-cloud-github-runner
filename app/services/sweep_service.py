@@ -268,7 +268,7 @@ class SweepService:
                     if job.get('status') != 'queued':
                         continue
                     label = self._runner_label({'labels': [
-                        {'name': l} for l in (job.get('labels') or [])
+                        {'name': name} for name in (job.get('labels') or [])
                     ]})
                     if label:
                         demand[label] += 1
