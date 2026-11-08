@@ -27,6 +27,7 @@ set -euo pipefail
 # RUNNING forever — terraform's build-image-*.sh wait loop spins
 # indefinitely. The trap guarantees the VM terminates so terraform can move
 # on (or fail-fast, depending on what got baked in before the failure).
+# shellcheck disable=SC2154  # exit_code is assigned inside the trap body
 trap '
         exit_code=$?
         echo "─── install.sh exiting with code ${exit_code} — shutting down VM in 10s ───"

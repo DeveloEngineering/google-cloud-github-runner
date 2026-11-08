@@ -57,18 +57,39 @@ jobs:
       - name: 🔍 Terraform Validate
         run: terraform validate
 
-      - name: 🔒 Setup TFLint
-        uses: terraform-linters/setup-tflint@v6
-        with:
-          tflint_version: latest
+      # TFLint and tfsec are installed from pinned, checksum-verified release
+      # binaries: the org Actions allowlist blocks terraform-linters/setup-tflint
+      # and aquasecurity/tfsec-action.
+      - name: 🔒 Install TFLint
+        env:
+          TFLINT_VERSION: v0.66.0
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/terraform-linters/tflint/releases/download/${TFLINT_VERSION}"
+          curl -fsSLO "${base}/tflint_linux_amd64.zip"
+          curl -fsSLO "${base}/checksums.txt"
+          grep ' tflint_linux_amd64.zip$' checksums.txt | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          unzip -q tflint_linux_amd64.zip -d "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
       - name: 🔍 Run TFLint
         run: tflint
 
       - name: 🛡️ Run tfsec
-        uses: aquasecurity/tfsec-action@v1.0.3
-        with:
-          working_directory: gcp
+        env:
+          TFSEC_VERSION: 1.28.14
+        run: |
+          tarball="tfsec_${TFSEC_VERSION}_linux_amd64.tar.gz"
+          base="https://github.com/aquasecurity/tfsec/releases/download/v${TFSEC_VERSION}"
+          (
+            cd "$RUNNER_TEMP"
+            curl -fsSLO "${base}/${tarball}"
+            curl -fsSLO "${base}/tfsec_${TFSEC_VERSION}_checksums.txt"
+            grep " ${tarball}$" "tfsec_${TFSEC_VERSION}_checksums.txt" | sha256sum -c -
+            tar -xzf "${tarball}" tfsec
+          )
+          "$RUNNER_TEMP/tfsec" .
 
   shell:
     name: "Shell 🐚"
