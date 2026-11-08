@@ -9,7 +9,6 @@ from flask import Blueprint, request, jsonify
 
 from app.services import SweepService
 from app.utils.auth import verify_scheduler_oidc_token
-from app import limiter
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +16,6 @@ sweep_bp = Blueprint('sweep', __name__)
 
 
 @sweep_bp.route('/sweep', methods=['POST'])
-@limiter.limit("60 per hour")
 def sweep():
     """Run one pass of the orphan-runner sweeper."""
     if not verify_scheduler_oidc_token(request.headers.get('Authorization')):
